@@ -70,10 +70,13 @@ GIT_EMAIL="${GIT_EMAIL:-CHANGE-ME@users.noreply.github.com}"
 # Optional: a GitHub personal access token used to run `gh auth login
 # --with-token` non-interactively and register the generated SSH keys with
 # GitHub via `gh ssh-key add`, instead of pasting them into the web UI by
-# hand. Needs `admin:public_key` on a classic token, or "SSH keys" +
-# "SSH signing keys" write access on a fine-grained one. Leave blank to skip:
-# gh still gets installed, and the printed instructions cover `gh auth login`
-# as an interactive alternative after first SSH login.
+# hand. Needs BOTH `admin:public_key` (registers the authentication key) AND
+# `admin:ssh_signing_key` (registers the signing key) on a classic token —
+# without the latter, `gh ssh-key add --type signing` fails with a 404 and a
+# scope hint. On a fine-grained token, grant "SSH keys" and "SSH signing
+# keys" write access. Leave blank to skip: gh still gets installed, and the
+# printed instructions cover `gh auth login` as an interactive alternative
+# after first SSH login.
 GH_TOKEN="${GH_TOKEN:-}"
 
 # Extra toolchain

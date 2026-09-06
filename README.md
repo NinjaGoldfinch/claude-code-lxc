@@ -157,8 +157,10 @@ pct console <CTID>                        # console from the Proxmox host
 - `GH_TOKEN`, like the root/dev passwords, is pushed to the guest only inside
   `/root/provision.env` (mode 0600) and shredded once provisioning finishes.
   It is never passed on argv, so it won't show up in `ps`. Use a short-lived
-  token scoped to just `admin:public_key` (classic) or SSH key read/write
-  (fine-grained), and revoke it once you've confirmed `gh auth status`.
+  token scoped to `admin:public_key` **and** `admin:ssh_signing_key` (classic
+  — the signing-key registration 404s without the second one), or "SSH keys"
+  + "SSH signing keys" write access (fine-grained), and revoke it once you've
+  confirmed `gh ssh-key list` shows both keys.
 - Remote Control makes outbound HTTPS only and never opens an inbound port. The
   session transcript is stored on Anthropic servers while connected; execution
   and filesystem access stay on your machine. See
