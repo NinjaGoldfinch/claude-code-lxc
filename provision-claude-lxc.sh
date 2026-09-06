@@ -3,7 +3,10 @@
 # provision-claude-lxc.sh
 #
 # Creates a Debian 13 (trixie) LXC container on a Proxmox VE host, set up as a
-# remote development box running Claude Code in Remote Control server mode.
+# remote development box running one or more *instances* of Claude Code in
+# Remote Control server mode. Each instance has its own workspace, its own tmux
+# session and its own name in the claude.ai/code session picker; they all share
+# one claude.ai login and one git/GitHub identity.
 #
 # It handles:
 #   * downloading + checksum-verifying the linuxcontainers.org rootfs
@@ -16,8 +19,10 @@
 #     login` otherwise)
 #   * hardened sshd (key-only, socket-activation disabled so Port works)
 #   * Claude Code install + settings tuned for Remote Control
-#   * a systemd unit that runs `claude remote-control` inside tmux and brings
-#     it back after a reboot or a crash
+#   * a templated systemd unit (claude-remote@<instance>.service) that runs
+#     `claude --remote-control` inside tmux and brings it back after a reboot
+#     or a crash, plus a claude-remote.target covering the whole fleet
+#   * a `claude-instance` CLI for adding/removing/listing instances at runtime
 #   * a credentials bundle written to the Proxmox host for you to file away
 #
 # RUN THIS ON THE PROXMOX HOST, AS ROOT.
@@ -27,6 +32,7 @@
 #
 # Everything below can be overridden from the environment, e.g.
 #   CTID=250 MEMORY=8192 GIT_EMAIL=me@example.com ./provision-claude-lxc.sh
+#   INSTANCES="riot-proxy ninja-recorder" ./provision-claude-lxc.sh
 #
 set -Eeuo pipefail
 
@@ -38,9 +44,12 @@ set -Eeuo pipefail
 CTID="${CTID:-}"                                   # blank = next free ID
 CT_HOSTNAME="${CT_HOSTNAME:-claude-dev}"
 CORES="${CORES:-4}"
-MEMORY="${MEMORY:-4096}"                           # MB. Claude Code wants 4GB+
+# MEMORY and DISK_GB default to a per-instance scale computed in preflight once
+# INSTANCES is parsed (4096 MB / 32 GB, plus 2048 MB / 16 GB per extra instance).
+# Set either explicitly to override.
+MEMORY="${MEMORY:-}"                               # MB. Claude Code wants 4GB+
 SWAP="${SWAP:-2048}"                               # MB
-DISK_GB="${DISK_GB:-32}"
+DISK_GB="${DISK_GB:-}"
 ROOTFS_STORAGE="${ROOTFS_STORAGE:-local-lvm}"      # storage for the container disk
 TEMPLATE_DIR="${TEMPLATE_DIR:-/var/lib/vz/template/cache}"
 CT_TAGS="${CT_TAGS:-claude,dev}"
@@ -57,10 +66,26 @@ LOCALE="${LOCALE:-en_US.UTF-8}"
 # Rootfs image (the one you linked; override to pick a newer build)
 ROOTFS_URL="${ROOTFS_URL:-https://images.linuxcontainers.org/images/debian/trixie/amd64/default/20260904_05:24/rootfs.tar.xz}"
 
-# Guest user + workspace
+# Guest user + workspaces
 DEV_USER="${DEV_USER:-dev}"
-WORKSPACE="${WORKSPACE:-/home/${DEV_USER}/projects}"
+WORKSPACE_ROOT="${WORKSPACE_ROOT:-/home/${DEV_USER}/projects}"
 SSH_PORT="${SSH_PORT:-22}"
+
+# Remote Control instances to create at provision time. Space- or
+# comma-separated specs, each either "name" or "name:/absolute/workspace/path".
+# A bare name gets ${WORKSPACE_ROOT}/<name> as its workspace. Names must match
+# [a-z0-9][a-z0-9_-]{0,30} so they are unambiguous as systemd unit instances,
+# tmux session names and directory names.
+#
+#   INSTANCES="main"                                  # the default: one instance
+#   INSTANCES="riot-proxy ninja-recorder"             # two, side by side
+#   INSTANCES="main:/home/dev/projects scratch"       # explicit workspace
+#
+# More can be added later on the box itself with:  claude-instance add <name>
+INSTANCES="${INSTANCES:-main}"
+
+# Session names shown in the claude.ai/code picker are "${CT_HOSTNAME}-<name>"
+# unless overridden per instance with `claude-instance add --session-name`.
 
 # Git identity used for commits and for the allowed_signers entry.
 # Use the same address you have verified on GitHub, or commits show as unverified.
@@ -118,6 +143,15 @@ rand_str() {
 
 need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
 
+# Instance names double as systemd unit instances, tmux session names and
+# directory names, so keep them to an unambiguous lowercase subset.
+valid_instance_name() {
+  case "$1" in
+    [a-z0-9]*) [ "${#1}" -le 31 ] && [ -z "${1//[a-z0-9_-]/}" ] ;;
+    *) return 1 ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
@@ -125,6 +159,48 @@ need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 log "Preflight checks"
 [ "$(id -u)" -eq 0 ] || die "run this as root on the Proxmox host"
 need pct; need pvesm; need openssl; need curl; need ssh-keygen
+
+# Parse INSTANCES into parallel name/workspace arrays. Do this before anything
+# expensive so a typo fails in the first second, not halfway through a build.
+INST_NAMES=(); INST_PATHS=()
+for spec in ${INSTANCES//,/ }; do
+  name="${spec%%:*}"
+  if [ "$spec" = "$name" ]; then ws="${WORKSPACE_ROOT}/${name}"; else ws="${spec#*:}"; fi
+  valid_instance_name "$name" \
+    || die "invalid instance name '${name}' — use [a-z0-9][a-z0-9_-]{0,30}"
+  case "$ws" in
+    /*) ;;
+    *) die "workspace for instance '${name}' must be an absolute path, got '${ws}'" ;;
+  esac
+  case "$ws" in
+    *[[:space:]]*|*\'*) die "workspace for instance '${name}' must not contain whitespace or quotes" ;;
+  esac
+  ws="${ws%/}"
+  for i in "${!INST_NAMES[@]}"; do
+    [ "${INST_NAMES[$i]}" = "$name" ] && die "instance '${name}' listed twice in INSTANCES"
+    [ "${INST_PATHS[$i]}" = "$ws" ] \
+      && die "instances '${INST_NAMES[$i]}' and '${name}' share workspace ${ws} — Claude Code keys session state off the working directory, so each instance needs its own"
+  done
+  INST_NAMES+=("$name"); INST_PATHS+=("$ws")
+done
+INST_COUNT="${#INST_NAMES[@]}"
+[ "$INST_COUNT" -gt 0 ] || die "INSTANCES is empty — name at least one instance"
+
+# Each concurrent Claude Code session wants its own headroom. Scale the
+# defaults with the instance count; an explicit MEMORY/DISK_GB still wins.
+MEMORY_RECOMMENDED=$(( 4096 + 2048 * (INST_COUNT - 1) ))
+DISK_RECOMMENDED=$(( 32 + 16 * (INST_COUNT - 1) ))
+if [ -z "$MEMORY" ]; then
+  MEMORY="$MEMORY_RECOMMENDED"
+elif [ "$MEMORY" -lt "$MEMORY_RECOMMENDED" ]; then
+  warn "MEMORY=${MEMORY}MB is below the ${MEMORY_RECOMMENDED}MB suggested for ${INST_COUNT} instance(s)"
+fi
+if [ -z "$DISK_GB" ]; then
+  DISK_GB="$DISK_RECOMMENDED"
+elif [ "$DISK_GB" -lt "$DISK_RECOMMENDED" ]; then
+  warn "DISK_GB=${DISK_GB} is below the ${DISK_RECOMMENDED}GB suggested for ${INST_COUNT} instance(s)"
+fi
+ok "${INST_COUNT} instance(s): ${INST_NAMES[*]} (${MEMORY}MB RAM, ${DISK_GB}GB disk)"
 command -v pveversion >/dev/null 2>&1 || warn "pveversion not found — is this really a PVE host?"
 
 if [ -z "$CTID" ]; then
@@ -249,12 +325,21 @@ ok "container is up with working DNS"
 # ---------------------------------------------------------------------------
 
 log "Provisioning the guest"
+
+# Flatten the parsed instances into one "name:path name:path" line for the
+# guest. Names and paths are already validated to be whitespace-free.
+INSTANCES_SPEC=""
+for i in "${!INST_NAMES[@]}"; do
+  INSTANCES_SPEC="${INSTANCES_SPEC}${INSTANCES_SPEC:+ }${INST_NAMES[$i]}:${INST_PATHS[$i]}"
+done
+
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"; die "aborted at line $LINENO"' ERR
 
 cat >"${STAGE}/provision.env" <<ENVEOF
 DEV_USER='${DEV_USER}'
-WORKSPACE='${WORKSPACE}'
+WORKSPACE_ROOT='${WORKSPACE_ROOT}'
+INSTANCES_SPEC='${INSTANCES_SPEC}'
 SSH_PORT='${SSH_PORT}'
 LOCALE='${LOCALE}'
 GIT_NAME='${GIT_NAME}'
@@ -495,15 +580,15 @@ cat > "${DEV_HOME}/.claude/settings.json" <<EOF
 {
   "autoUpdatesChannel": "${CLAUDE_CHANNEL}",
   "remoteControlAtStartup": true,
-  "includeCoAuthoredBy": true,
+  "includeCoAuthoredBy": false,
   "theme": "dark"
 }
 EOF
 chown "$DEV_USER:$DEV_USER" "${DEV_HOME}/.claude/settings.json"
 chmod 600 "${DEV_HOME}/.claude/settings.json"
-install -d -m 755 -o "$DEV_USER" -g "$DEV_USER" "$WORKSPACE"
+install -d -m 755 -o "$DEV_USER" -g "$DEV_USER" "$WORKSPACE_ROOT"
 
-say "tmux + helper scripts"
+say "tmux"
 cat > "${DEV_HOME}/.tmux.conf" <<'EOF'
 set -g mouse on
 set -g history-limit 50000
@@ -513,70 +598,386 @@ set -g status-fg colour255
 EOF
 chown "$DEV_USER:$DEV_USER" "${DEV_HOME}/.tmux.conf"
 
-# The supervised loop. Remote Control makes outbound HTTPS only, so nothing
-# needs to be exposed. It requires a claude.ai login (Pro/Max/Team/Enterprise);
-# an API key will not work, and ANTHROPIC_BASE_URL must stay unset.
-cat > /usr/local/bin/claude-remote-session <<EOF
+# --- instance registry -----------------------------------------------------
+# An instance is a name plus a workspace; everything else is derived from it:
+#   registry   /etc/claude-instances/<name>.env
+#   unit       claude-remote@<name>.service   (part of claude-remote.target)
+#   tmux       claude-<name>
+#   session    <name shown in the claude.ai/code picker>
+# All instances share ~/.claude, so one `/login` authenticates every one of
+# them. They must not share a workspace: Claude Code keys session state off the
+# working directory.
+install -d -m 755 -o root -g root /etc/claude-instances
+
+# The supervised loop, one process per instance. Remote Control makes outbound
+# HTTPS only, so nothing needs to be exposed. It requires a claude.ai login
+# (Pro/Max/Team/Enterprise); an API key will not work, and ANTHROPIC_BASE_URL
+# must stay unset. Every setting it needs comes from the registry file, so this
+# script needs nothing expanded into it at provision time.
+cat > /usr/local/bin/claude-remote-session <<'EOF'
 #!/usr/bin/env bash
 set -uo pipefail
-cd "${WORKSPACE}" || exit 1
-unset ANTHROPIC_API_KEY ANTHROPIC_BASE_URL DISABLE_TELEMETRY DO_NOT_TRACK \\
+
+INSTANCE="${1:-}"
+[ -n "$INSTANCE" ] || { echo "usage: claude-remote-session <instance>" >&2; exit 2; }
+REG="/etc/claude-instances/${INSTANCE}.env"
+[ -r "$REG" ] || { echo "no such instance: ${INSTANCE} (expected ${REG})" >&2; exit 2; }
+# shellcheck source=/dev/null
+. "$REG"
+
+cd "$WORKSPACE" || { echo "workspace ${WORKSPACE} is gone" >&2; exit 1; }
+
+# Each of these silently breaks Remote Control, so clear them defensively:
+# an API key cannot establish a session, a gateway base URL cannot reach it,
+# and the telemetry opt-outs disable the feature-flag lookup it depends on.
+unset ANTHROPIC_API_KEY ANTHROPIC_BASE_URL DISABLE_TELEMETRY DO_NOT_TRACK \
       DISABLE_GROWTHBOOK CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
-export PATH="\$HOME/.local/bin:\$HOME/.npm-global/bin:\$PATH"
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
 
 while true; do
   if ! command -v claude >/dev/null 2>&1; then
     echo "claude not on PATH; retrying in 30s"; sleep 30; continue
   fi
-  echo "starting: claude remote-control --name ${CT_HOSTNAME}"
-  claude remote-control --name "${CT_HOSTNAME}"
-  code=\$?
+  echo "starting: claude --remote-control ${SESSION_NAME}   (workspace ${WORKSPACE})"
+  claude --remote-control "$SESSION_NAME"
+  code=$?
   echo
-  echo "remote-control exited (\$code)."
+  echo "remote control for '${INSTANCE}' exited (${code})."
   echo "If it says you are not signed in, run:  claude   then  /login"
-  echo "Retrying in 15s. Ctrl-C twice to stop, or: sudo systemctl stop claude-remote"
+  echo "Retrying in 15s. Ctrl-C twice to stop, or:"
+  echo "  sudo claude-instance stop ${INSTANCE}"
   sleep 15
 done
 EOF
 chmod 755 /usr/local/bin/claude-remote-session
 
-cat > /usr/local/bin/claude-attach <<EOF
+# --- claude-instance: the runtime interface --------------------------------
+# Expanded prelude first (it needs the provisioning values), literal body
+# second, so nothing in the logic has to be backslash-escaped.
+cat > /usr/local/bin/claude-instance <<EOF
 #!/usr/bin/env bash
-exec tmux attach -t claude
+# Manage Claude Code Remote Control instances. Generated by provision-claude-lxc.sh.
+DEV_USER='${DEV_USER}'
+WORKSPACE_ROOT='${WORKSPACE_ROOT}'
+CT_HOSTNAME='${CT_HOSTNAME}'
+EOF
+cat >> /usr/local/bin/claude-instance <<'EOF'
+set -uo pipefail
+
+REG_DIR=/etc/claude-instances
+TARGET=claude-remote.target
+
+die()   { printf 'claude-instance: %s\n' "$*" >&2; exit 1; }
+unit()  { printf 'claude-remote@%s.service' "$1"; }
+regf()  { printf '%s/%s.env' "$REG_DIR" "$1"; }
+tmuxs() { printf 'claude-%s' "$1"; }
+
+# Same rule the provisioner enforces: unambiguous as a systemd unit instance,
+# a tmux session name and a directory name all at once.
+valid_name() {
+  case "$1" in
+    [a-z0-9]*) [ "${#1}" -le 31 ] && [ -z "${1//[a-z0-9_-]/}" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+# Mutating subcommands need root for systemctl and /etc; attach and logs do not.
+need_root() {
+  [ "$(id -u)" -eq 0 ] && return 0
+  command -v sudo >/dev/null 2>&1 || die "must be run as root"
+  exec sudo -E "$0" "$@"
+}
+
+# tmux sessions belong to the dev user, so reach them as that user when root.
+as_dev() {
+  if [ "$(id -u)" -eq 0 ] && [ "$(id -un)" != "$DEV_USER" ]; then
+    sudo -u "$DEV_USER" -H "$@"
+  else
+    "$@"
+  fi
+}
+
+names() {
+  local f n
+  shopt -s nullglob
+  for f in "$REG_DIR"/*.env; do n="${f##*/}"; printf '%s\n' "${n%.env}"; done
+  shopt -u nullglob
+}
+
+load() {
+  local f; f="$(regf "$1")"
+  [ -r "$f" ] || die "no such instance: $1  (try: claude-instance list)"
+  INSTANCE=""; WORKSPACE=""; SESSION_NAME=""
+  # shellcheck source=/dev/null
+  . "$f"
+}
+
+check_workspace() {
+  case "$1" in
+    /*) ;;
+    *) die "workspace must be an absolute path, got '$1'" ;;
+  esac
+  case "$1" in
+    *[[:space:]]*|*\'*) die "workspace must not contain whitespace or quotes" ;;
+  esac
+}
+
+cmd_list() {
+  local n state enabled tmux_state
+  printf '%-16s %-26s %-34s %-10s %-9s %s\n' NAME SESSION WORKSPACE ACTIVE ENABLED TMUX
+  for n in $(names); do
+    load "$n"
+    state="$(systemctl is-active "$(unit "$n")" 2>/dev/null || true)"
+    enabled="$(systemctl is-enabled "$(unit "$n")" 2>/dev/null || true)"
+    if as_dev tmux has-session -t "$(tmuxs "$n")" 2>/dev/null; then
+      tmux_state=up
+    else
+      tmux_state=down
+    fi
+    printf '%-16s %-26s %-34s %-10s %-9s %s\n' \
+      "$n" "$SESSION_NAME" "$WORKSPACE" "${state:-unknown}" "${enabled:-unknown}" "$tmux_state"
+  done
+}
+
+cmd_add() {
+  need_root add "$@"
+  local name="" ws="" session="" start=1 other
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --workspace)    ws="${2:-}";      shift 2 ;;
+      --session-name) session="${2:-}"; shift 2 ;;
+      --no-start)     start=0;          shift ;;
+      -*)             die "unknown option for add: $1" ;;
+      *)              [ -z "$name" ] || die "add takes one name"; name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: claude-instance add <name> [--workspace PATH] [--session-name NAME] [--no-start]"
+  valid_name "$name" || die "invalid instance name '$name' — use [a-z0-9][a-z0-9_-]{0,30}"
+  [ -e "$(regf "$name")" ] && die "instance '$name' already exists"
+
+  [ -n "$ws" ] || ws="${WORKSPACE_ROOT}/${name}"
+  check_workspace "$ws"
+  ws="${ws%/}"
+  for other in $(names); do
+    load "$other"
+    [ "$WORKSPACE" = "$ws" ] && die "instance '$other' already uses workspace ${ws} — each instance needs its own"
+  done
+  [ -n "$session" ] || session="${CT_HOSTNAME}-${name}"
+
+  install -d -m 755 -o "$DEV_USER" -g "$DEV_USER" "$ws"
+  ( umask 022
+    cat > "$(regf "$name")" <<REG
+INSTANCE='${name}'
+WORKSPACE='${ws}'
+SESSION_NAME='${session}'
+REG
+  )
+  systemctl enable "$(unit "$name")" >/dev/null 2>&1 \
+    || die "could not enable $(unit "$name")"
+  if [ "$start" -eq 1 ]; then
+    systemctl start "$(unit "$name")" || die "could not start $(unit "$name")"
+    printf 'added and started %s  (session %s, workspace %s)\n' "$name" "$session" "$ws"
+  else
+    printf 'added %s  (session %s, workspace %s) — not started\n' "$name" "$session" "$ws"
+  fi
+}
+
+cmd_remove() {
+  need_root remove "$@"
+  local name="" purge=0 assume_yes=0 reply
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge)    purge=1; shift ;;
+      -y|--yes)   assume_yes=1; shift ;;
+      -*)         die "unknown option for remove: $1" ;;
+      *)          [ -z "$name" ] || die "remove takes one name"; name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: claude-instance remove <name> [--purge] [--yes]"
+  load "$name"
+  local ws="$WORKSPACE"
+
+  # Vet the purge before touching anything, so refusing it cannot leave the
+  # instance half-removed.
+  if [ "$purge" -eq 1 ]; then
+    case "$ws" in
+      /|/home|/root|/home/"$DEV_USER"|"$WORKSPACE_ROOT")
+        die "refusing to purge ${ws} — drop --purge and delete it by hand if you mean it" ;;
+    esac
+    if [ "$assume_yes" -eq 0 ]; then
+      printf 'delete workspace %s and everything in it? [y/N] ' "$ws"
+      read -r reply
+      case "$reply" in [yY]|[yY][eE][sS]) ;; *) die "aborted — ${name} left alone" ;; esac
+    fi
+  fi
+
+  systemctl disable --now "$(unit "$name")" >/dev/null 2>&1 || true
+  as_dev tmux kill-session -t "$(tmuxs "$name")" >/dev/null 2>&1 || true
+  rm -f "$(regf "$name")"
+  printf 'removed instance %s\n' "$name"
+
+  if [ "$purge" -eq 1 ]; then
+    rm -rf -- "$ws"
+    printf 'purged workspace %s\n' "$ws"
+  else
+    printf 'workspace left in place: %s\n' "$ws"
+  fi
+}
+
+# start / stop / restart, over one instance or --all.
+cmd_lifecycle() {
+  local action="$1"; shift
+  need_root "$action" "$@"
+  local targets=() n
+  if [ $# -eq 0 ]; then
+    die "usage: claude-instance ${action} <name>... | --all"
+  elif [ "$1" = "--all" ]; then
+    mapfile -t targets < <(names)
+    [ "${#targets[@]}" -gt 0 ] || die "no instances configured"
+  else
+    targets=("$@")
+  fi
+  for n in "${targets[@]}"; do
+    [ -e "$(regf "$n")" ] || die "no such instance: $n"
+    systemctl "$action" "$(unit "$n")" || die "systemctl ${action} failed for ${n}"
+    printf '%s %s\n' "$action" "$n"
+  done
+}
+
+cmd_attach() {
+  local name="${1:-}" count
+  if [ -z "$name" ]; then
+    count="$(names | wc -l)"
+    if [ "$count" -eq 1 ]; then
+      name="$(names)"
+    elif [ "$count" -eq 0 ]; then
+      die "no instances configured — create one with: sudo claude-instance add <name>"
+    else
+      echo "several instances are configured — name the one you want:" >&2
+      cmd_list >&2
+      exit 1
+    fi
+  fi
+  [ -e "$(regf "$name")" ] || die "no such instance: $name  (try: claude-instance list)"
+  as_dev tmux has-session -t "$(tmuxs "$name")" 2>/dev/null \
+    || die "instance '$name' has no live tmux session — start it with: sudo claude-instance start $name"
+  # exec needs a real command, so as_dev cannot be used here.
+  if [ "$(id -u)" -eq 0 ] && [ "$(id -un)" != "$DEV_USER" ]; then
+    exec sudo -u "$DEV_USER" -H tmux attach -t "$(tmuxs "$name")"
+  fi
+  exec tmux attach -t "$(tmuxs "$name")"
+}
+
+cmd_logs() {
+  local name="" follow=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--follow) follow=(-f); shift ;;
+      *)           name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: claude-instance logs <name> [-f]"
+  [ -e "$(regf "$name")" ] || die "no such instance: $name"
+  exec journalctl "${follow[@]}" -u "$(unit "$name")"
+}
+
+usage() {
+  cat <<USAGE
+claude-instance — manage Claude Code Remote Control instances on this box
+
+  list                                     show every instance and its state
+  add <name> [--workspace PATH]            create an instance and start it
+             [--session-name NAME]         (default workspace ${WORKSPACE_ROOT}/<name>,
+             [--no-start]                   default session name ${CT_HOSTNAME}-<name>)
+  remove <name> [--purge] [--yes]          stop, disable and forget an instance
+  start|stop|restart <name>... | --all     lifecycle for one, several, or all
+  attach [name]                            attach to the instance's tmux session
+  logs <name> [-f]                         journal for the instance's unit
+
+All instances share one claude.ai login (~/.claude), so signing in once covers
+them all. Each needs its own workspace. Whole fleet at once:
+
+  sudo systemctl restart ${TARGET}
+USAGE
+}
+
+case "${1:-}" in
+  list|ls)            shift; cmd_list "$@" ;;
+  add|create)         shift; cmd_add "$@" ;;
+  remove|rm|delete)   shift; cmd_remove "$@" ;;
+  start|stop|restart) action="$1"; shift; cmd_lifecycle "$action" "$@" ;;
+  attach)             shift; cmd_attach "$@" ;;
+  logs)               shift; cmd_logs "$@" ;;
+  ""|-h|--help|help)  usage ;;
+  *)                  printf 'claude-instance: unknown command: %s\n\n' "$1" >&2; usage >&2; exit 1 ;;
+esac
+EOF
+chmod 755 /usr/local/bin/claude-instance
+
+# Kept for the `ca` alias and for muscle memory.
+cat > /usr/local/bin/claude-attach <<'EOF'
+#!/usr/bin/env bash
+exec claude-instance attach "$@"
 EOF
 chmod 755 /usr/local/bin/claude-attach
 
-say "systemd unit"
-cat > /etc/systemd/system/claude-remote.service <<EOF
+say "systemd units"
+# One template unit covers every instance. WorkingDirectory has to be a literal
+# (systemd does not expand variables there), so the per-instance cd lives in
+# claude-remote-session instead.
+cat > /etc/systemd/system/claude-remote@.service <<EOF
 [Unit]
-Description=Claude Code Remote Control session (tmux)
+Description=Claude Code Remote Control session (%i)
 After=network-online.target
 Wants=network-online.target
+PartOf=claude-remote.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 User=${DEV_USER}
 Group=${DEV_USER}
-WorkingDirectory=${WORKSPACE}
+WorkingDirectory=${DEV_HOME}
 Environment=HOME=${DEV_HOME}
 Environment=TERM=xterm-256color
-ExecStart=/usr/bin/tmux new-session -d -s claude /usr/local/bin/claude-remote-session
-ExecStop=/usr/bin/tmux kill-session -t claude
+ExecStartPre=-/usr/bin/tmux kill-session -t claude-%i
+ExecStart=/usr/bin/tmux new-session -d -s claude-%i /usr/local/bin/claude-remote-session %i
+ExecStop=-/usr/bin/tmux kill-session -t claude-%i
 TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target claude-remote.target
+EOF
+
+cat > /etc/systemd/system/claude-remote.target <<EOF
+[Unit]
+Description=All Claude Code Remote Control instances
+After=network-online.target
+Wants=network-online.target
 
 [Install]
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable claude-remote.service >/dev/null
+systemctl enable claude-remote.target >/dev/null
+
+say "Remote Control instances"
+for spec in $INSTANCES_SPEC; do
+  inst_name="${spec%%:*}"
+  inst_ws="${spec#*:}"
+  # --no-start: nothing can connect until the one-time claude.ai login is done,
+  # so leave them enabled but idle and let the operator start the target.
+  /usr/local/bin/claude-instance add "$inst_name" --workspace "$inst_ws" --no-start
+done
 
 cat >> "${DEV_HOME}/.bashrc" <<'EOF'
 
 # --- claude dev box ---
 alias ca='claude-attach'
+alias ci='claude-instance'
 if [ -z "${TMUX:-}" ] && [ -n "${SSH_TTY:-}" ]; then
-  echo "Claude Remote Control session: run 'ca' (or 'claude-attach') to attach."
+  echo "Claude Remote Control instances:  claude-instance list   (alias: ci)"
+  echo "Attach to one:                    ca <instance>"
 fi
 EOF
 chown "$DEV_USER:$DEV_USER" "${DEV_HOME}/.bashrc"
@@ -602,8 +1003,8 @@ pct exec "$CTID" -- /bin/bash /root/provision.sh
 pct exec "$CTID" -- rm -f /root/provision.sh
 ok "guest provisioned"
 
-log "Starting the Claude Remote Control service"
-pct exec "$CTID" -- systemctl start claude-remote.service || warn "service start returned non-zero"
+log "Starting the Claude Remote Control instances"
+pct exec "$CTID" -- systemctl start claude-remote.target || warn "target start returned non-zero"
 
 # ---------------------------------------------------------------------------
 # Collect keys and write the credentials bundle
@@ -626,6 +1027,14 @@ GH_AUTH_PUB="$(cat "${OUT_DIR}/id_ed25519_github_auth.pub" 2>/dev/null || echo '
 GH_SIGN_PUB="$(cat "${OUT_DIR}/id_ed25519_github_signing.pub" 2>/dev/null || echo '<pull failed>')"
 CLAUDE_VER="$(pct exec "$CTID" -- sudo -u "$DEV_USER" -H bash -lc 'claude --version' 2>/dev/null || echo 'unknown')"
 GH_AUTH_STATUS="$(pct exec "$CTID" -- sudo -u "$DEV_USER" -H bash -lc 'gh auth status 2>&1' 2>/dev/null || echo 'gh not installed or not authenticated')"
+
+INSTANCE_TABLE="$(
+  printf '%-16s %-26s %s\n' NAME 'SESSION NAME' WORKSPACE
+  for i in "${!INST_NAMES[@]}"; do
+    printf '%-16s %-26s %s\n' \
+      "${INST_NAMES[$i]}" "${CT_HOSTNAME}-${INST_NAMES[$i]}" "${INST_PATHS[$i]}"
+  done
+)"
 
 if [ -n "$GH_TOKEN" ]; then
   GH_CRED_NOTE="Registered automatically via 'gh ssh-key add' during provisioning
@@ -702,12 +1111,24 @@ update it and rewrite allowed_signers:
   printf '%s namespaces="git" %s\n' you@example.com \\
     "\$(cat ~/.ssh/id_ed25519_github_signing.pub)" > ~/.config/git/allowed_signers
 
+-- Remote Control instances --------------------------------------------------------
+${INSTANCE_TABLE}
+
+Each instance is its own Remote Control server with its own workspace and its
+own entry in the claude.ai/code session picker. They share one claude.ai login
+(~/.claude) and one git identity, so you only sign in once.
+
 -- Day to day --------------------------------------------------------------------
-Attach to the running session:   ssh in, then  ca
-Service control:                 sudo systemctl {status,restart,stop} claude-remote
-Session logs:                    journalctl -u claude-remote
-Workspace:                       ${WORKSPACE}
-Autostart:                       container onboot=1 + claude-remote.service enabled
+List instances:                  claude-instance list          (alias: ci list)
+Attach to one:                   ca <instance>
+Add another:                     sudo claude-instance add <name>
+Remove one:                      sudo claude-instance remove <name> [--purge]
+Per-instance control:            sudo claude-instance {start,stop,restart} <name>
+Whole fleet:                     sudo systemctl restart claude-remote.target
+Per-instance logs:               journalctl -u claude-remote@<instance>
+Workspace root:                  ${WORKSPACE_ROOT}
+Autostart:                       container onboot=1 + claude-remote.target and each
+                                 claude-remote@<instance>.service enabled
 ================================================================================
 EOF
 chmod 600 "$CRED_FILE"
@@ -739,17 +1160,31 @@ Remote Control needs a claude.ai login (Pro, Max, Team, or Enterprise). An API
 key will not work. OAuth can't open a browser in here, so it prints a URL and
 takes a code back.
 
+Every instance shares one login, so you only do this once.
+
   1) ssh -i ${LOGIN_KEY} -p ${SSH_PORT} ${DEV_USER}@${CT_ADDR}
-  2) cd ${WORKSPACE} && claude
+  2) cd ${INST_PATHS[0]} && claude
        - accept the workspace-trust prompt
        - run /login and follow the URL + code flow
        - Ctrl-C out once you're signed in
-  3) sudo systemctl restart claude-remote
-  4) ca            # attach to tmux; the session URL and QR code are shown there
+  3) sudo systemctl restart claude-remote.target
+  4) ci list       # every instance and its state
+     ca ${INST_NAMES[0]}   # attach; the session URL and QR code are shown there
 
-Then open claude.ai/code or the Claude mobile app and pick the session named
-"${CT_HOSTNAME}". It survives reboots: the container starts on boot and
-claude-remote.service brings the tmux session back with it.
+Then open claude.ai/code or the Claude mobile app. ${INST_COUNT} session(s) will be
+waiting, one per instance:
+
+$(for i in "${!INST_NAMES[@]}"; do
+    printf '  %-28s %s\n' "${CT_HOSTNAME}-${INST_NAMES[$i]}" "${INST_PATHS[$i]}"
+  done)
+
+Add more at any time, no reprovision needed:
+
+  sudo claude-instance add <name>              # workspace ${WORKSPACE_ROOT}/<name>
+  sudo claude-instance remove <name> [--purge]
+
+It all survives reboots: the container starts on boot and claude-remote.target
+brings every enabled instance back with it.
 
 ${C_B}GitHub CLI:${C_0} ${GH_NEXT_STEP}
 

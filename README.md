@@ -5,6 +5,12 @@ running [Claude Code](https://code.claude.com/docs) in Remote Control server
 mode, so you can drive a real dev box from claude.ai/code or the Claude mobile
 app.
 
+The box is **instanced**: it runs as many independent Remote Control servers as
+you want, each with its own workspace, its own supervised tmux session and its
+own entry in the claude.ai/code session picker. They share one claude.ai login
+and one git identity, so you sign in once. Add and remove them at runtime with
+`claude-instance` — no reprovisioning.
+
 It generates every credential randomly and hands them back in a format you can
 paste straight into a password manager and into GitHub.
 
@@ -14,25 +20,32 @@ Run this on the **Proxmox host**, as root:
 
 ```bash
 curl -fsSL -o provision-claude-lxc.sh \
-  https://raw.githubusercontent.com/YOURUSER/claude-code-lxc/main/provision-claude-lxc.sh
+  https://raw.githubusercontent.com/NinjaGoldfinch/claude-code-lxc/main/provision-claude-lxc.sh
 chmod +x provision-claude-lxc.sh
-GIT_EMAIL=you@example.com ./provision-claude-lxc.sh
+GIT_EMAIL=you@example.com INSTANCES="riot-proxy ninja-recorder" ./provision-claude-lxc.sh
 ```
+
+`INSTANCES` is optional — leave it out and you get a single instance named
+`main`.
 
 Read it before you run it. If you would rather not, the one-liner is:
 
 ```bash
-GIT_EMAIL=you@example.com bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOURUSER/claude-code-lxc/main/provision-claude-lxc.sh)"
+GIT_EMAIL=you@example.com bash -c "$(curl -fsSL https://raw.githubusercontent.com/NinjaGoldfinch/claude-code-lxc/main/provision-claude-lxc.sh)"
 ```
 
 If the repo is private, `raw.githubusercontent.com` needs auth. Use
-`gh repo clone YOURUSER/claude-code-lxc` on the host instead, or add
+`gh repo clone NinjaGoldfinch/claude-code-lxc` on the host instead, or add
 `-H "Authorization: Bearer $GITHUB_TOKEN"` to the curl.
 
 ## What you get
 
-- An unprivileged LXC on Debian trixie, `onboot=1`, `nesting=1,keyctl=1`, 4 GB
-  RAM by default (Claude Code's documented minimum).
+- An unprivileged LXC on Debian trixie, `onboot=1`, `nesting=1,keyctl=1`. RAM
+  and disk default to 4 GB / 32 GB (Claude Code's documented minimum) and scale
+  by +2 GB / +16 GB per extra instance.
+- N Remote Control instances, each a `claude-remote@<name>.service` under a
+  shared `claude-remote.target`, plus a `claude-instance` CLI to add, remove,
+  list, attach to and tail them without reprovisioning.
 - The rootfs image checksum-verified against the `SHA256SUMS` published next to
   it before `pct create` runs.
 - A random root password and a random password for the `dev` user, for console
@@ -57,12 +70,56 @@ If the repo is private, `raw.githubusercontent.com` needs auth. Use
   trusting whatever `ssh-keyscan` returns.
 - Claude Code installed via the native installer (auto-updating), falling back
   to the signed apt repository with a fingerprint check.
-- `claude-remote.service`: a systemd unit that runs `claude remote-control`
-  inside a supervised tmux loop, so it comes back after a reboot or a crash.
+- A templated `claude-remote@<instance>.service` that runs
+  `claude --remote-control <session>` inside a supervised tmux loop, so every
+  instance comes back after a reboot or a crash.
 - Node.js 22, build-essential, Python 3, ripgrep, fd, jq, tmux, and the rest of
   the usual toolchain.
 - A credentials bundle at `/root/claude-lxc-<CTID>/CREDENTIALS.txt` on the host,
   laid out as ready-to-file password manager entries.
+
+## Instances
+
+An instance is a name plus a workspace. Everything else is derived from it:
+
+| Thing | Value |
+| --- | --- |
+| Registry entry | `/etc/claude-instances/<name>.env` |
+| Workspace | `<WORKSPACE_ROOT>/<name>`, overridable |
+| Session name in claude.ai/code | `<CT_HOSTNAME>-<name>`, overridable |
+| tmux session | `claude-<name>` |
+| systemd unit | `claude-remote@<name>.service` |
+
+Names must match `[a-z0-9][a-z0-9_-]{0,30}` so they stay unambiguous as systemd
+unit instances, tmux session names and directory names all at once.
+
+```bash
+claude-instance list                          # every instance and its state
+sudo claude-instance add scratch              # workspace <root>/scratch, started
+sudo claude-instance add api --workspace /srv/api --session-name api-box
+sudo claude-instance remove scratch           # keeps the workspace
+sudo claude-instance remove scratch --purge   # deletes it too, after confirming
+sudo claude-instance restart api
+claude-instance logs api -f
+ca api                                        # attach to its tmux session
+```
+
+`ca` and `ci` are aliases for `claude-attach` and `claude-instance`. Whole fleet
+at once: `sudo systemctl restart claude-remote.target`.
+
+Two things follow from instances sharing one `~/.claude`:
+
+- **One login covers all of them.** Sign in once and every instance, including
+  ones you add months later, is authenticated.
+- **Settings, history and MCP servers are shared too**, and each instance needs
+  its own workspace — Claude Code keys session state off the working directory,
+  so `add` refuses a directory another instance already claims.
+
+Each concurrent instance is a full Claude Code process; budget roughly 2 GB of
+RAM apiece beyond the first. `INSTANCES` sizes the container for you at
+provision time, but `claude-instance add` on a live box cannot grow it — check
+`free -m` before piling more on, and resize with
+`pct set <CTID> --memory <MB>`.
 
 ## One manual step
 
@@ -70,16 +127,20 @@ Remote Control requires a claude.ai login on a Pro, Max, Team, or Enterprise
 plan. An API key will not work. OAuth cannot open a browser inside a headless
 container, so it prints a URL and takes a code back. After the script finishes:
 
+Because every instance shares one login, you only do this once no matter how
+many you run.
+
 ```bash
 ssh -i /root/claude-lxc-<CTID>/id_ed25519_claude-dev dev@<container-ip>
-cd ~/projects && claude          # accept workspace trust, then /login
+cd ~/projects/main && claude     # any instance's workspace; accept trust, then /login
 # Ctrl-C once you are signed in
-sudo systemctl restart claude-remote
-ca                               # attach to tmux; session URL and QR code are here
+sudo systemctl restart claude-remote.target
+ci list                          # every instance and its state
+ca main                          # attach to tmux; session URL and QR code are here
 ```
 
-Then open [claude.ai/code](https://claude.ai/code) or the Claude mobile app and
-pick the session by name.
+Then open [claude.ai/code](https://claude.ai/code) or the Claude mobile app —
+one session per instance will be waiting, named `<CT_HOSTNAME>-<instance>`.
 
 If you did not pass `GH_TOKEN`, there's a second manual step for GitHub itself
 — from the same SSH session:
@@ -101,12 +162,14 @@ Everything is an environment variable. Defaults in parentheses.
 | --- | --- |
 | `CTID` | Container ID (next free) |
 | `CT_HOSTNAME` | Hostname (`claude-dev`) |
-| `CORES` / `MEMORY` / `SWAP` / `DISK_GB` | Resources (`4` / `4096` / `2048` / `32`) |
+| `INSTANCES` | Instances to create, space/comma separated, each `name` or `name:/abs/path` (`main`) |
+| `CORES` / `SWAP` | Resources (`4` / `2048`) |
+| `MEMORY` / `DISK_GB` | Resources, scaled by instance count (`4096 + 2048×(n-1)` MB / `32 + 16×(n-1)` GB) |
 | `ROOTFS_STORAGE` | Storage for the container disk (`local-lvm`) |
 | `BRIDGE` / `CT_IP` / `CT_GW` / `CT_VLAN` | Networking (`vmbr0` / `dhcp`) |
 | `NAMESERVER` | Resolvers (`1.1.1.1 9.9.9.9`) |
 | `ROOTFS_URL` | linuxcontainers.org rootfs to use |
-| `DEV_USER` / `WORKSPACE` / `SSH_PORT` | Guest user, project dir, sshd port |
+| `DEV_USER` / `WORKSPACE_ROOT` / `SSH_PORT` | Guest user, parent dir for instance workspaces, sshd port |
 | `GIT_NAME` / `GIT_EMAIL` | Git identity and `allowed_signers` entry |
 | `GH_TOKEN` | GitHub token for non-interactive `gh auth login` + automatic key registration (blank = do it interactively later) |
 | `INSTALL_NODE` | Install Node.js 22 (`1`) |
@@ -117,6 +180,7 @@ Example:
 
 ```bash
 CTID=250 MEMORY=8192 DISK_GB=64 CT_IP=192.168.1.50/24 CT_GW=192.168.1.1 \
+INSTANCES="riot-proxy ninja-recorder scratch:/srv/scratch" \
 GIT_EMAIL=you@example.com ./provision-claude-lxc.sh
 ```
 
@@ -139,10 +203,11 @@ The wrapper script unsets all of these defensively before starting the session.
 ## Day to day
 
 ```bash
-ca                                        # attach to the running session
-sudo systemctl status claude-remote
-sudo systemctl restart claude-remote
-journalctl -u claude-remote
+ci list                                   # instances and their state
+ca <instance>                             # attach to one session
+sudo claude-instance restart <instance>
+claude-instance logs <instance> -f
+sudo systemctl restart claude-remote.target   # every instance at once
 pct console <CTID>                        # console from the Proxmox host
 ```
 
