@@ -47,7 +47,15 @@ die() { printf 'claude-lxc-runtime: %s\n' "$*" >&2; exit 1; }
 
 CONF=/etc/claude-lxc.conf
 # shellcheck source=/dev/null
+# Capture the environment first: sourcing the config file plain-assigns these,
+# which would otherwise silently beat an explicit override from the caller.
+ENV_DEV_USER="${DEV_USER:-}"
+ENV_WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
+ENV_CT_HOSTNAME="${CT_HOSTNAME:-}"
 [ -r "$CONF" ] && . "$CONF"
+DEV_USER="${ENV_DEV_USER:-${DEV_USER:-}}"
+WORKSPACE_ROOT="${ENV_WORKSPACE_ROOT:-${WORKSPACE_ROOT:-}}"
+CT_HOSTNAME="${ENV_CT_HOSTNAME:-${CT_HOSTNAME:-}}"
 
 DEV_USER="${DEV_USER:-dev}"
 id -u "$DEV_USER" >/dev/null 2>&1 || die "user '${DEV_USER}' does not exist — is this a claude-code-lxc container?"
@@ -240,7 +248,7 @@ cmd_list() {
 
 cmd_add() {
   need_root add "$@"
-  local name="" ws="" session="" start=1 other
+  local name="" ws="" session="" start=1 other name_dns
   while [ $# -gt 0 ]; do
     case "$1" in
       --workspace)    ws="${2:-}";      shift 2 ;;
@@ -261,7 +269,17 @@ cmd_add() {
     load "$other"
     [ "$WORKSPACE" = "$ws" ] && die "instance '$other' already uses workspace ${ws} — each instance needs its own"
   done
-  [ -n "$session" ] || session="${CT_HOSTNAME}-${name}"
+  if [ -z "$session" ]; then
+    # A box named after its project would otherwise read
+    # "ninja-recorder-dev-container-ninja-recorder" in the picker, so drop the
+    # repetition when the hostname already leads with the instance name.
+    # Hostnames fold underscores to hyphens, so compare the folded form.
+    name_dns="${name//_/-}"
+    case "$CT_HOSTNAME" in
+      "$name_dns"|"$name_dns"-*) session="$CT_HOSTNAME" ;;
+      *)                         session="${CT_HOSTNAME}-${name}" ;;
+    esac
+  fi
 
   install -d -m 755 -o "$DEV_USER" -g "$DEV_USER" "$ws"
   ( umask 022
@@ -387,7 +405,9 @@ claude-instance — manage Claude Code Remote Control instances on this box
   list                                     show every instance and its state
   add <name> [--workspace PATH]            create an instance and start it
              [--session-name NAME]         (default workspace ${WORKSPACE_ROOT}/<name>,
-             [--no-start]                   default session name ${CT_HOSTNAME}-<name>)
+             [--no-start]                   default session name ${CT_HOSTNAME}-<name>,
+                                            or just ${CT_HOSTNAME} when it
+                                            already starts with <name>)
   remove <name> [--purge] [--yes]          stop, disable and forget an instance
   start|stop|restart <name>... | --all     lifecycle for one, several, or all
   attach [name]                            attach to the instance's tmux session
