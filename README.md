@@ -84,6 +84,9 @@ file on the way through.
 
 ## What you get
 
+- A container named after the project it is built for —
+  `ninja-recorder-dev-container`, numbered `-2`, `-3` for later boxes on the
+  same node.
 - An unprivileged LXC on Debian trixie, `onboot=1`, `nesting=1,keyctl=1`. RAM
   and disk default to 4 GB / 32 GB (Claude Code's documented minimum) and scale
   by +2 GB / +16 GB per extra instance.
@@ -132,7 +135,7 @@ An instance is a name plus a workspace. Everything else is derived from it:
 | --- | --- |
 | Registry entry | `/etc/claude-instances/<name>.env` |
 | Workspace | `<WORKSPACE_ROOT>/<name>`, overridable |
-| Session name in claude.ai/code | `<CT_HOSTNAME>-<name>`, overridable |
+| Session name in claude.ai/code | `<CT_HOSTNAME>-<name>`, collapsing to `<CT_HOSTNAME>` when the hostname already starts with the instance name. Overridable |
 | tmux session | `claude-<name>` |
 | systemd unit | `claude-remote@<name>.service` |
 
@@ -177,7 +180,7 @@ Because every instance shares one login, you only do this once no matter how
 many you run.
 
 ```bash
-ssh -i /root/claude-lxc-<CTID>/id_ed25519_claude-dev dev@<container-ip>
+ssh -i /root/claude-lxc-<CTID>/id_ed25519_<CT_HOSTNAME> dev@<container-ip>
 cd ~/projects/main && claude     # any instance's workspace; accept trust, then /login
 # Ctrl-C once you are signed in
 sudo systemctl restart claude-remote.target
@@ -186,7 +189,8 @@ ca main                          # attach to tmux; session URL and QR code are h
 ```
 
 Then open [claude.ai/code](https://claude.ai/code) or the Claude mobile app —
-one session per instance will be waiting, named `<CT_HOSTNAME>-<instance>`.
+one session per instance will be waiting. The exact names are printed at the end
+of provisioning and listed in the credentials bundle.
 
 If you did not pass `GH_TOKEN`, there's a second manual step for GitHub itself
 — from the same SSH session:
@@ -200,6 +204,45 @@ gh ssh-key add ~/.ssh/id_ed25519_github_signing.pub --type signing --title "dev 
 `gh auth login` without `--with-token` walks you through a device-code flow:
 it prints a URL and a one-time code to enter on any browser, no token needed.
 
+## Hostnames
+
+A container built for a single project is named after it, so it is recognisable
+in the Proxmox node list:
+
+```bash
+INSTANCES="ninja-recorder" ./provision-claude-lxc.sh   # -> ninja-recorder-dev-container
+```
+
+Build a second box for the same project and the name is numbered rather than
+duplicated. The script reads the hostnames already on the node and takes the
+next free one:
+
+```
+ninja-recorder-dev-container      # first
+ninja-recorder-dev-container-2    # second
+ninja-recorder-dev-container-3    # third
+```
+
+With several instances there is no single project to name it after, so it falls
+back to `claude-dev` (and `claude-dev-2`, and so on). Underscores in an instance
+name are folded to hyphens, since hostnames cannot contain them. Setting
+`CT_HOSTNAME` explicitly overrides all of this — the name is then used as given,
+with a warning if it clashes, and rejected outright if it is not a valid DNS
+label.
+
+The hostname also drives the session names in the claude.ai/code picker. Rather
+than `ninja-recorder-dev-container-ninja-recorder`, a session whose instance
+name already leads the hostname just uses the hostname:
+
+| Hostname | Instance | Session name |
+| --- | --- | --- |
+| `ninja-recorder-dev-container` | `ninja-recorder` | `ninja-recorder-dev-container` |
+| `ninja-recorder-dev-container-2` | `ninja-recorder` | `ninja-recorder-dev-container-2` |
+| `ninja-recorder-dev-container` | `scratch` | `ninja-recorder-dev-container-scratch` |
+| `claude-dev` | `riot-proxy` | `claude-dev-riot-proxy` |
+
+`claude-instance add --session-name` overrides it per instance.
+
 ## Configuration
 
 Everything is an environment variable. Defaults in parentheses.
@@ -207,7 +250,7 @@ Everything is an environment variable. Defaults in parentheses.
 | Variable | What it does |
 | --- | --- |
 | `CTID` | Container ID (next free) |
-| `CT_HOSTNAME` | Hostname (`claude-dev`) |
+| `CT_HOSTNAME` | Hostname. Derived from the project when unset — see [Hostnames](#hostnames) |
 | `INSTANCES` | Instances to create, space/comma separated, each `name` or `name:/abs/path` (`main`) |
 | `CORES` / `SWAP` | Resources (`4` / `2048`) |
 | `MEMORY` / `DISK_GB` | Resources, scaled by instance count (`4096 + 2048×(n-1)` MB / `32 + 16×(n-1)` GB) |

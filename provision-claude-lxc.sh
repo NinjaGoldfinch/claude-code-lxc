@@ -42,7 +42,12 @@ set -Eeuo pipefail
 
 # Container identity / resources
 CTID="${CTID:-}"                                   # blank = next free ID
-CT_HOSTNAME="${CT_HOSTNAME:-claude-dev}"
+# Blank means "derive it". A container built for a single project is named after
+# that project — INSTANCES="ninja-recorder" gives ninja-recorder-dev-container —
+# so it is recognisable in the Proxmox node list. With several instances there is
+# no single project to name it after, so it falls back to claude-dev. Set this
+# explicitly to override either case.
+CT_HOSTNAME="${CT_HOSTNAME:-}"
 CORES="${CORES:-4}"
 # MEMORY and DISK_GB default to a per-instance scale computed in preflight once
 # INSTANCES is parsed (4096 MB / 32 GB, plus 2048 MB / 16 GB per extra instance).
@@ -84,8 +89,11 @@ SSH_PORT="${SSH_PORT:-22}"
 # More can be added later on the box itself with:  claude-instance add <name>
 INSTANCES="${INSTANCES:-main}"
 
-# Session names shown in the claude.ai/code picker are "${CT_HOSTNAME}-<name>"
-# unless overridden per instance with `claude-instance add --session-name`.
+# Session names shown in the claude.ai/code picker are "${CT_HOSTNAME}-<name>",
+# collapsing to just "${CT_HOSTNAME}" when the hostname already begins with the
+# instance name — so a single-project box reads "ninja-recorder-dev-container"
+# rather than "ninja-recorder-dev-container-ninja-recorder". Override per
+# instance with `claude-instance add --session-name`.
 
 # Git identity used for commits and for the allowed_signers entry.
 # Use the same address you have verified on GitHub, or commits show as unverified.
@@ -149,6 +157,48 @@ rand_str() {
 
 need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
 
+# Hostnames are DNS labels: letters, digits and hyphens only, no leading or
+# trailing hyphen, 63 characters at most. Instance names may contain
+# underscores, which are not legal here, so they are folded to hyphens.
+valid_hostname() {
+  case "$1" in
+    -*|*-) return 1 ;;
+    *[!a-zA-Z0-9-]*) return 1 ;;
+    "") return 1 ;;
+  esac
+  [ "${#1}" -le 63 ]
+}
+
+hostname_for_project() {
+  local n="${1//_/-}"
+  printf '%s-dev-container' "$n"
+}
+
+# Hostnames of the containers already on this node, one per line. Read from
+# `pct config` rather than parsing `pct list` columns, which shift when the
+# Lock field is empty.
+existing_hostnames() {
+  local id
+  for id in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
+    pct config "$id" 2>/dev/null | sed -n 's/^hostname: //p'
+  done
+}
+
+# Append -2, -3, ... until the name is free, so provisioning a second box for
+# the same project gives ninja-recorder-dev-container-2.
+unique_hostname() {
+  local base="$1" candidate="$1" n=2
+  local -a taken=()
+  mapfile -t taken < <(existing_hostnames)
+  [ "${#taken[@]}" -eq 0 ] && { printf '%s' "$base"; return 0; }
+  while printf '%s\n' "${taken[@]}" | grep -qxF -- "$candidate"; do
+    candidate="${base}-${n}"
+    n=$((n + 1))
+    [ "$n" -gt 99 ] && die "could not find a free hostname based on '${base}' — pass CT_HOSTNAME explicitly"
+  done
+  printf '%s' "$candidate"
+}
+
 # Instance names double as systemd unit instances, tmux session names and
 # directory names, so keep them to an unambiguous lowercase subset.
 valid_instance_name() {
@@ -207,6 +257,29 @@ elif [ "$DISK_GB" -lt "$DISK_RECOMMENDED" ]; then
   warn "DISK_GB=${DISK_GB} is below the ${DISK_RECOMMENDED}GB suggested for ${INST_COUNT} instance(s)"
 fi
 ok "${INST_COUNT} instance(s): ${INST_NAMES[*]} (${MEMORY}MB RAM, ${DISK_GB}GB disk)"
+
+# Name the container after the project when there is exactly one of them, then
+# number it if that name is already taken on this node.
+if [ -z "$CT_HOSTNAME" ]; then
+  if [ "$INST_COUNT" -eq 1 ]; then
+    CT_HOSTNAME_BASE="$(hostname_for_project "${INST_NAMES[0]}")"
+  else
+    CT_HOSTNAME_BASE="claude-dev"
+  fi
+  CT_HOSTNAME="$(unique_hostname "$CT_HOSTNAME_BASE")"
+  if [ "$CT_HOSTNAME" = "$CT_HOSTNAME_BASE" ]; then
+    ok "hostname: ${CT_HOSTNAME}"
+  else
+    ok "hostname: ${CT_HOSTNAME} (${CT_HOSTNAME_BASE} is already in use on this node)"
+  fi
+else
+  # An explicit name is honoured as given; a clash is the caller's business.
+  if existing_hostnames | grep -qxF -- "$CT_HOSTNAME"; then
+    warn "a container named '${CT_HOSTNAME}' already exists on this node — using it anyway"
+  fi
+fi
+valid_hostname "$CT_HOSTNAME" \
+  || die "CT_HOSTNAME '${CT_HOSTNAME}' is not a valid hostname — letters, digits and inner hyphens only, 63 characters max"
 command -v pveversion >/dev/null 2>&1 || warn "pveversion not found — is this really a PVE host?"
 
 if [ -z "$CTID" ]; then
@@ -660,12 +733,18 @@ GH_SIGN_PUB="$(cat "${OUT_DIR}/id_ed25519_github_signing.pub" 2>/dev/null || ech
 CLAUDE_VER="$(pct exec "$CTID" -- sudo -u "$DEV_USER" -H bash -lc 'claude --version' 2>/dev/null || echo 'unknown')"
 GH_AUTH_STATUS="$(pct exec "$CTID" -- sudo -u "$DEV_USER" -H bash -lc 'gh auth status 2>&1' 2>/dev/null || echo 'gh not installed or not authenticated')"
 
+# Read the session names back out of the container rather than recomputing the
+# naming rule here — claude-instance owns that rule, and this cannot drift.
+READ_REGISTRY='for f in /etc/claude-instances/*.env; do ( . "$f"; printf "%s\t%s\t%s\n" "$INSTANCE" "$SESSION_NAME" "$WORKSPACE" ); done'
+INSTANCE_ROWS="$(pct exec "$CTID" -- bash -c "$READ_REGISTRY" 2>/dev/null || true)"
 INSTANCE_TABLE="$(
-  printf '%-16s %-26s %s\n' NAME 'SESSION NAME' WORKSPACE
-  for i in "${!INST_NAMES[@]}"; do
-    printf '%-16s %-26s %s\n' \
-      "${INST_NAMES[$i]}" "${CT_HOSTNAME}-${INST_NAMES[$i]}" "${INST_PATHS[$i]}"
-  done
+  printf '%-16s %-30s %s\n' NAME 'SESSION NAME' WORKSPACE
+  if [ -n "$INSTANCE_ROWS" ]; then
+    printf '%s\n' "$INSTANCE_ROWS" \
+      | while IFS=$'\t' read -r n sess ws; do printf '%-16s %-30s %s\n' "$n" "$sess" "$ws"; done
+  else
+    echo '<could not read /etc/claude-instances — check claude-instance list on the box>'
+  fi
 )"
 
 if [ -n "$GH_TOKEN" ]; then
@@ -806,9 +885,8 @@ Every instance shares one login, so you only do this once.
 Then open claude.ai/code or the Claude mobile app. ${INST_COUNT} session(s) will be
 waiting, one per instance:
 
-$(for i in "${!INST_NAMES[@]}"; do
-    printf '  %-28s %s\n' "${CT_HOSTNAME}-${INST_NAMES[$i]}" "${INST_PATHS[$i]}"
-  done)
+$(printf '%s\n' "$INSTANCE_ROWS" \
+    | while IFS=$'\t' read -r n sess ws; do printf '  %-30s %s\n' "$sess" "$ws"; done)
 
 Add more at any time, no reprovision needed:
 
