@@ -1,0 +1,9 @@
+# never commit generated credentials
+CREDENTIALS.txt
+id_ed25519*
+*.pem
+*.key
+claude-lxc-*/
+*.tar.xz
+*.part
+.DS_Store
