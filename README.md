@@ -14,21 +14,35 @@ and one git identity, so you sign in once. Add and remove them at runtime with
 It generates every credential randomly and hands them back in a format you can
 paste straight into a password manager and into GitHub.
 
+## The three scripts
+
+| Script | Runs on | Does |
+| --- | --- | --- |
+| `provision-claude-lxc.sh` | Proxmox host | Builds the container from scratch: credentials, keys, toolchain, instances |
+| `update-claude-lxc.sh` | Proxmox host | Refreshes the code on a container that already exists. Touches no credentials |
+| `claude-lxc-runtime.sh` | Inside the container | Installs the runtime files. The single source of truth both of the above push |
+
+You run the first two. The third is shared machinery, so provisioning and
+updating can never drift apart.
+
 ## Quick start
 
 Run this on the **Proxmox host**, as root:
 
 ```bash
-curl -fsSL -o provision-claude-lxc.sh \
-  https://raw.githubusercontent.com/NinjaGoldfinch/claude-code-lxc/main/provision-claude-lxc.sh
-chmod +x provision-claude-lxc.sh
+git clone https://github.com/NinjaGoldfinch/claude-code-lxc
+cd claude-code-lxc
 GIT_EMAIL=you@example.com INSTANCES="riot-proxy ninja-recorder" ./provision-claude-lxc.sh
 ```
+
+`provision-claude-lxc.sh` needs `claude-lxc-runtime.sh` beside it. If it is not
+there — running straight from a `curl`, say — it is fetched from this repo's
+`main`. Set `RUNTIME_SRC=/path/to/claude-lxc-runtime.sh` to pin a local copy.
 
 `INSTANCES` is optional — leave it out and you get a single instance named
 `main`.
 
-Read it before you run it. If you would rather not, the one-liner is:
+Read the scripts before you run them. If you would rather not, the one-liner is:
 
 ```bash
 GIT_EMAIL=you@example.com bash -c "$(curl -fsSL https://raw.githubusercontent.com/NinjaGoldfinch/claude-code-lxc/main/provision-claude-lxc.sh)"
@@ -38,6 +52,36 @@ If the repo is private, `raw.githubusercontent.com` needs auth. Use
 `gh repo clone NinjaGoldfinch/claude-code-lxc` on the host instead, or add
 `-H "Authorization: Bearer $GITHUB_TOKEN"` to the curl.
 
+## Updating
+
+Pull the repo and re-run the code onto containers you already have:
+
+```bash
+cd claude-code-lxc && git pull
+./update-claude-lxc.sh 250            # one container
+./update-claude-lxc.sh 250 251 252    # several
+./update-claude-lxc.sh 250 --no-restart
+```
+
+It refreshes the `claude-instance` CLI, the session wrapper, the systemd unit
+and target, the PATH snippet and the shell aliases, then restarts the instances
+that were running. Instances you had stopped stay stopped.
+
+It deliberately does **not** touch anything you would have to redo:
+
+- no passwords generated or changed
+- no SSH keys created, replaced or re-registered with GitHub
+- `~/.claude` untouched, so your claude.ai login survives
+- git config, `allowed_signers` and the `gh` auth state left alone
+- `/etc/claude-instances/*.env` left alone — instances and workspaces come back
+  exactly as they were
+- `~/.claude/settings.json` and `~/.tmux.conf` are yours after provisioning and
+  are never rewritten
+
+Containers provisioned before `/etc/claude-lxc.conf` existed are handled too:
+the update recovers their settings from the installed CLI and writes the config
+file on the way through.
+
 ## What you get
 
 - An unprivileged LXC on Debian trixie, `onboot=1`, `nesting=1,keyctl=1`. RAM
@@ -46,6 +90,8 @@ If the repo is private, `raw.githubusercontent.com` needs auth. Use
 - N Remote Control instances, each a `claude-remote@<name>.service` under a
   shared `claude-remote.target`, plus a `claude-instance` CLI to add, remove,
   list, attach to and tail them without reprovisioning.
+- `/etc/claude-lxc.conf` recording the box's `DEV_USER`, `WORKSPACE_ROOT` and
+  `CT_HOSTNAME`, so `update-claude-lxc.sh` needs nothing but the CTID.
 - The rootfs image checksum-verified against the `SHA256SUMS` published next to
   it before `pct create` runs.
 - A random root password and a random password for the `dev` user, for console
@@ -237,6 +283,9 @@ pct console <CTID>                        # console from the Proxmox host
 pct stop <CTID> && pct destroy <CTID>
 rm -rf /root/claude-lxc-<CTID>
 ```
+
+To drop a single instance without touching the rest of the box, use
+`sudo claude-instance remove <name> [--purge]` instead.
 
 ## License
 
