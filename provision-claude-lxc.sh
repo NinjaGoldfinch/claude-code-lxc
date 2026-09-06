@@ -11,6 +11,9 @@
 #   * random root + dev-user passwords (for your password manager)
 #   * an ed25519 SSH keypair for logging into the box
 #   * separate ed25519 keys for GitHub *authentication* and *commit signing*
+#   * the GitHub CLI (gh), used to authenticate and register both keys with
+#     GitHub automatically when GH_TOKEN is supplied (interactive `gh auth
+#     login` otherwise)
 #   * hardened sshd (key-only, socket-activation disabled so Port works)
 #   * Claude Code install + settings tuned for Remote Control
 #   * a systemd unit that runs `claude remote-control` inside tmux and brings
@@ -63,6 +66,15 @@ SSH_PORT="${SSH_PORT:-22}"
 # Use the same address you have verified on GitHub, or commits show as unverified.
 GIT_NAME="${GIT_NAME:-Claude Dev}"
 GIT_EMAIL="${GIT_EMAIL:-CHANGE-ME@users.noreply.github.com}"
+
+# Optional: a GitHub personal access token used to run `gh auth login
+# --with-token` non-interactively and register the generated SSH keys with
+# GitHub via `gh ssh-key add`, instead of pasting them into the web UI by
+# hand. Needs `admin:public_key` on a classic token, or "SSH keys" +
+# "SSH signing keys" write access on a fine-grained one. Leave blank to skip:
+# gh still gets installed, and the printed instructions cover `gh auth login`
+# as an interactive alternative after first SSH login.
+GH_TOKEN="${GH_TOKEN:-}"
 
 # Extra toolchain
 INSTALL_NODE="${INSTALL_NODE:-1}"                  # Node.js 22 from NodeSource
@@ -251,6 +263,7 @@ GITHUB_ED25519_FP='${GITHUB_ED25519_FP}'
 ALLOW_UNVERIFIED_GITHUB_HOSTKEY='${ALLOW_UNVERIFIED_GITHUB_HOSTKEY}'
 ROOT_PW='${ROOT_PW}'
 DEV_PW='${DEV_PW}'
+GH_TOKEN='${GH_TOKEN}'
 ENVEOF
 
 cp "${LOGIN_KEY}.pub" "${STAGE}/login_key.pub"
@@ -376,6 +389,50 @@ sudo -u "$DEV_USER" git config --global user.signingkey "${SIGN_KEY}.pub"
 sudo -u "$DEV_USER" git config --global commit.gpgsign true
 sudo -u "$DEV_USER" git config --global tag.gpgsign true
 sudo -u "$DEV_USER" git config --global gpg.ssh.allowedSignersFile "${DEV_HOME}/.config/git/allowed_signers"
+
+say "GitHub CLI (gh)"
+install -d -m 0755 /etc/apt/keyrings
+if curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+     -o /etc/apt/keyrings/githubcli-archive-keyring.gpg 2>/dev/null; then
+  chmod 644 /etc/apt/keyrings/githubcli-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    > /etc/apt/sources.list.d/github-cli.list
+  apt-get update -qq
+  apt-get install -y -qq gh || echo "WARNING: gh package install failed"
+else
+  echo "WARNING: could not fetch the GitHub CLI signing key; skipping gh install"
+fi
+
+say "GitHub CLI authentication"
+if ! command -v gh >/dev/null 2>&1; then
+  echo "gh is not installed; skipping automatic auth and key registration."
+  echo "Set it up later with: gh auth login --git-protocol ssh --hostname github.com"
+elif [ -z "$GH_TOKEN" ]; then
+  echo "No GH_TOKEN provided; skipping automatic auth and key registration."
+  echo "After first login, run:"
+  echo "  gh auth login --git-protocol ssh --hostname github.com"
+  echo "  gh ssh-key add ~/.ssh/id_ed25519_github_auth.pub --type authentication --title '${GIT_EMAIL} (github auth, ${CT_HOSTNAME})'"
+  echo "  gh ssh-key add ~/.ssh/id_ed25519_github_signing.pub --type signing --title '${GIT_EMAIL} (git signing, ${CT_HOSTNAME})'"
+else
+  if printf '%s' "$GH_TOKEN" \
+       | sudo -u "$DEV_USER" -H gh auth login --hostname github.com --git-protocol ssh --with-token \
+       2>/tmp/gh_login.err; then
+    ok_msg="gh authenticated as $(sudo -u "$DEV_USER" -H gh api user -q .login 2>/dev/null || echo '<unknown>')"
+    echo "$ok_msg"
+    sudo -u "$DEV_USER" -H gh auth setup-git >/dev/null 2>&1 \
+      || echo "WARNING: gh auth setup-git failed"
+    sudo -u "$DEV_USER" -H gh ssh-key add "$AUTH_KEY.pub" --type authentication \
+        --title "${GIT_EMAIL} (github auth, ${CT_HOSTNAME})" 2>/tmp/gh_authkey.err \
+      || echo "WARNING: could not register the authentication key with gh (it may already be registered): $(cat /tmp/gh_authkey.err 2>/dev/null)"
+    sudo -u "$DEV_USER" -H gh ssh-key add "$SIGN_KEY.pub" --type signing \
+        --title "${GIT_EMAIL} (git signing, ${CT_HOSTNAME})" 2>/tmp/gh_signkey.err \
+      || echo "WARNING: could not register the signing key with gh (it may already be registered): $(cat /tmp/gh_signkey.err 2>/dev/null)"
+  else
+    echo "WARNING: gh auth login --with-token failed: $(cat /tmp/gh_login.err 2>/dev/null)"
+    echo "Falling back to manual setup after first login (see README)."
+  fi
+  rm -f /tmp/gh_login.err /tmp/gh_authkey.err /tmp/gh_signkey.err
+fi
 
 if [ "$INSTALL_NODE" = "1" ]; then
   say "Node.js 22"
@@ -565,6 +622,23 @@ HOSTKEY_FPS="$(pct exec "$CTID" -- bash -c 'for k in /etc/ssh/ssh_host_*_key.pub
 GH_AUTH_PUB="$(cat "${OUT_DIR}/id_ed25519_github_auth.pub" 2>/dev/null || echo '<pull failed>')"
 GH_SIGN_PUB="$(cat "${OUT_DIR}/id_ed25519_github_signing.pub" 2>/dev/null || echo '<pull failed>')"
 CLAUDE_VER="$(pct exec "$CTID" -- sudo -u "$DEV_USER" -H bash -lc 'claude --version' 2>/dev/null || echo 'unknown')"
+GH_AUTH_STATUS="$(pct exec "$CTID" -- sudo -u "$DEV_USER" -H bash -lc 'gh auth status 2>&1' 2>/dev/null || echo 'gh not installed or not authenticated')"
+
+if [ -n "$GH_TOKEN" ]; then
+  GH_CRED_NOTE="Registered automatically via 'gh ssh-key add' during provisioning
+(GH_TOKEN was supplied). Current status on the box:
+
+${GH_AUTH_STATUS}
+
+If either registration warned above, add the key manually at the URL below."
+else
+  GH_CRED_NOTE="No GH_TOKEN was supplied, so these were NOT registered with GitHub.
+Easiest: ssh in and run
+  gh auth login --git-protocol ssh --hostname github.com
+  gh ssh-key add ~/.ssh/id_ed25519_github_auth.pub --type authentication --title '${GIT_EMAIL} (github auth, ${CT_HOSTNAME})'
+  gh ssh-key add ~/.ssh/id_ed25519_github_signing.pub --type signing --title '${GIT_EMAIL} (git signing, ${CT_HOSTNAME})'
+Or add the public keys below by hand at the URL under each one."
+fi
 
 CRED_FILE="${OUT_DIR}/CREDENTIALS.txt"
 umask 077
@@ -598,15 +672,18 @@ ${HOSTKEY_FPS}
 
 -- 1Password: SSH Key item — GitHub authentication ------------------------------
 Private key file: ${OUT_DIR}/id_ed25519_github_auth
-Public key (add to GitHub as an AUTHENTICATION key):
+Public key (AUTHENTICATION key):
 ${GH_AUTH_PUB}
   https://github.com/settings/ssh/new  ->  Key type: Authentication Key
 
 -- 1Password: SSH Key item — GitHub commit signing ------------------------------
 Private key file: ${OUT_DIR}/id_ed25519_github_signing
-Public key (add to GitHub as a SIGNING key):
+Public key (SIGNING key):
 ${GH_SIGN_PUB}
   https://github.com/settings/ssh/new  ->  Key type: Signing Key
+
+-- GitHub CLI (gh) registration --------------------------------------------------
+${GH_CRED_NOTE}
 
 Both private keys also live in the container at
   /home/${DEV_USER}/.ssh/  — the copies here are for your password manager.
@@ -636,6 +713,18 @@ chmod 600 "$CRED_FILE"
 # Done
 # ---------------------------------------------------------------------------
 
+if [ -n "$GH_TOKEN" ]; then
+  GH_NEXT_STEP="GitHub CLI (gh) was authenticated during provisioning and both SSH keys were
+registered automatically. Check the credentials bundle's 'gh auth status'
+output if either registration step warned above."
+else
+  GH_NEXT_STEP="GitHub CLI (gh) is installed but not signed in (no GH_TOKEN was given). Once
+you're in, finish it with:
+       gh auth login --git-protocol ssh --hostname github.com
+       gh ssh-key add ~/.ssh/id_ed25519_github_auth.pub --type authentication --title '${GIT_EMAIL} (github auth, ${CT_HOSTNAME})'
+       gh ssh-key add ~/.ssh/id_ed25519_github_signing.pub --type signing --title '${GIT_EMAIL} (git signing, ${CT_HOSTNAME})'"
+fi
+
 cat <<EOF
 
 ${C_OK}${C_B}Container ${CTID} (${CT_HOSTNAME}) is up.${C_0}
@@ -658,5 +747,7 @@ takes a code back.
 Then open claude.ai/code or the Claude mobile app and pick the session named
 "${CT_HOSTNAME}". It survives reboots: the container starts on boot and
 claude-remote.service brings the tmux session back with it.
+
+${C_B}GitHub CLI:${C_0} ${GH_NEXT_STEP}
 
 EOF

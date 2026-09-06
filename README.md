@@ -45,6 +45,14 @@ If the repo is private, `raw.githubusercontent.com` needs auth. Use
 - Git preconfigured for SSH commit signing: `gpg.format=ssh`,
   `commit.gpgsign=true`, `tag.gpgsign=true`, and an `allowed_signers` file so
   `git log --show-signature` verifies locally too.
+- The GitHub CLI (`gh`), installed from GitHub's signed apt repo. If you pass
+  a `GH_TOKEN`, the script runs `gh auth login --with-token`, `gh auth
+  setup-git` (so `https://` git operations also authenticate via `gh`), and
+  registers both generated SSH keys with GitHub — the authentication key with
+  `gh ssh-key add --type authentication`, the signing key with `--type
+  signing`. No token, no problem: `gh` is still installed, and the printed
+  instructions cover doing the same three steps interactively after your
+  first SSH login.
 - GitHub's ed25519 host key fingerprint pinned at provision time rather than
   trusting whatever `ssh-keyscan` returns.
 - Claude Code installed via the native installer (auto-updating), falling back
@@ -73,6 +81,18 @@ ca                               # attach to tmux; session URL and QR code are h
 Then open [claude.ai/code](https://claude.ai/code) or the Claude mobile app and
 pick the session by name.
 
+If you did not pass `GH_TOKEN`, there's a second manual step for GitHub itself
+— from the same SSH session:
+
+```bash
+gh auth login --git-protocol ssh --hostname github.com
+gh ssh-key add ~/.ssh/id_ed25519_github_auth.pub --type authentication --title "dev box auth"
+gh ssh-key add ~/.ssh/id_ed25519_github_signing.pub --type signing --title "dev box signing"
+```
+
+`gh auth login` without `--with-token` walks you through a device-code flow:
+it prints a URL and a one-time code to enter on any browser, no token needed.
+
 ## Configuration
 
 Everything is an environment variable. Defaults in parentheses.
@@ -88,6 +108,7 @@ Everything is an environment variable. Defaults in parentheses.
 | `ROOTFS_URL` | linuxcontainers.org rootfs to use |
 | `DEV_USER` / `WORKSPACE` / `SSH_PORT` | Guest user, project dir, sshd port |
 | `GIT_NAME` / `GIT_EMAIL` | Git identity and `allowed_signers` entry |
+| `GH_TOKEN` | GitHub token for non-interactive `gh auth login` + automatic key registration (blank = do it interactively later) |
 | `INSTALL_NODE` | Install Node.js 22 (`1`) |
 | `CLAUDE_CHANNEL` | `latest` or `stable` |
 | `ALLOW_UNVERIFIED_GITHUB_HOSTKEY` | Continue past a GitHub host key mismatch (`0`) |
@@ -133,6 +154,11 @@ pct console <CTID>                        # console from the Proxmox host
   password manager. Delete `/root/claude-lxc-<CTID>/` once they are stored.
 - The container is unprivileged. `nesting=1` is set because Claude Code's
   sandboxing and some container tooling need user namespaces.
+- `GH_TOKEN`, like the root/dev passwords, is pushed to the guest only inside
+  `/root/provision.env` (mode 0600) and shredded once provisioning finishes.
+  It is never passed on argv, so it won't show up in `ps`. Use a short-lived
+  token scoped to just `admin:public_key` (classic) or SSH key read/write
+  (fine-grained), and revoke it once you've confirmed `gh auth status`.
 - Remote Control makes outbound HTTPS only and never opens an inbound port. The
   session transcript is stored on Anthropic servers while connected; execution
   and filesystem access stay on your machine. See
