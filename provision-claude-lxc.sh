@@ -16,8 +16,9 @@
 #   * an ed25519 SSH keypair for logging into the box
 #   * separate ed25519 keys for GitHub *authentication* and *commit signing*
 #   * the GitHub CLI (gh), used to authenticate and register both keys with
-#     GitHub automatically when GH_TOKEN is supplied (interactive `gh auth
-#     login` otherwise)
+#     GitHub automatically when a token is available — GH_TOKEN, or one you
+#     get by signing in (browser or pasted token) when the script asks, before
+#     the container is created (interactive `gh auth login` in the box otherwise)
 #   * hardened sshd (key-only, socket-activation disabled so Port works)
 #   * Claude Code install + settings tuned for Remote Control
 #   * a templated systemd unit (claude-remote@<instance>.service) that runs
@@ -117,6 +118,21 @@ GIT_EMAIL="${GIT_EMAIL:-CHANGE-ME@users.noreply.github.com}"
 # after first SSH login.
 GH_TOKEN="${GH_TOKEN:-}"
 
+# How to get a GitHub token when GH_TOKEN is blank, before the container is
+# created, so the box comes up with gh signed in and both keys registered:
+#   ask    offer the choices below when run from a terminal (the default);
+#          behaves like skip when there is no terminal to ask on
+#   web    sign in through the browser with a one-time device code. Needs gh
+#          on the Proxmox host; it runs against a throwaway config directory,
+#          so the host's own gh login, if any, is left untouched
+#   paste  paste a personal access token (a pre-filled creation link is shown)
+#   skip   no token; sign in from inside the container later
+# A supplied GH_TOKEN always wins and nothing is asked.
+GH_AUTH="${GH_AUTH:-ask}"
+# With GH_AUTH=ask, confirm "continue as <login>?" before the token is passed
+# into the container. Set to 1 to pass it in without that confirmation.
+GH_AUTH_YES="${GH_AUTH_YES:-0}"
+
 # Extra toolchain
 INSTALL_NODE="${INSTALL_NODE:-1}"                  # Node.js 22 from NodeSource
 CLAUDE_CHANNEL="${CLAUDE_CHANNEL:-latest}"         # latest | stable
@@ -175,6 +191,145 @@ rand_str() {
 }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+# --- GitHub token acquisition ------------------------------------------------
+
+# Classic-token scopes the guest needs: repo + read:org are what
+# `gh auth login --with-token` insists on, the two admin scopes register the
+# authentication and signing keys. gist and workflow match gh's own login.
+GH_SCOPES="repo,read:org,gist,workflow,admin:public_key,admin:ssh_signing_key"
+
+tty_ok() { [ -t 0 ] && { : </dev/tty; } 2>/dev/null; }
+
+# Device-code sign-in through gh on the host, isolated in a temp config dir.
+gh_token_via_web() {
+  local cfg tok help
+  local -a extra=()
+  command -v gh >/dev/null 2>&1 || { warn "gh is not installed on this host — cannot sign in via browser"; return 1; }
+  # Older gh (Debian bookworm ships 2.23) lacks some flags; only pass what it knows.
+  help="$(gh auth login --help 2>&1 || true)"
+  case "$help" in *--skip-ssh-key*)     extra+=(--skip-ssh-key) ;; esac
+  case "$help" in *--insecure-storage*) extra+=(--insecure-storage) ;; esac
+  cfg="$(mktemp -d)"
+  printf '\nA one-time code and a URL follow. Open the URL on any device, enter the\ncode and approve; this host never sees your password.\n\n' >/dev/tty
+  if ! env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+         GH_CONFIG_DIR="$cfg" GH_BROWSER=true BROWSER=true \
+         gh auth login --hostname github.com --web --git-protocol ssh "${extra[@]}" \
+           --scopes "${GH_SCOPES#repo,read:org,gist,}" </dev/tty >/dev/tty 2>&1; then
+    rm -rf "$cfg"
+    warn "browser sign-in failed"
+    return 1
+  fi
+  tok="$(env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$cfg" gh auth token --hostname github.com 2>/dev/null || true)"
+  rm -rf "$cfg"
+  [ -n "$tok" ] || { warn "signed in, but gh did not hand back a token"; return 1; }
+  GH_TOKEN="$tok"
+}
+
+gh_token_via_paste() {
+  local tok
+  printf '\nCreate a classic token with the scopes pre-selected here (short expiry is fine):\n\n  https://github.com/settings/tokens/new?description=%s&scopes=%s\n\n' \
+    "${CT_HOSTNAME:-claude-lxc}" "$GH_SCOPES" >/dev/tty
+  printf 'A fine-grained token works too if it has "SSH keys" and "SSH signing keys"\nwrite access, but gh inside the box then only reaches what the token grants.\n\n' >/dev/tty
+  printf 'Paste the token (input hidden, blank to skip): ' >/dev/tty
+  IFS= read -rs tok </dev/tty || tok=""
+  printf '\n' >/dev/tty
+  [ -n "$tok" ] || return 1
+  GH_TOKEN="$tok"
+}
+
+# Asks GitHub who the token belongs to, warns on missing classic scopes.
+# Sets GH_LOGIN. Fails if GitHub rejects the token outright.
+gh_token_check() {
+  local hdrs body scopes missing="" sc
+  hdrs="$(mktemp)"
+  if ! body="$(curl -fsS --max-time 15 -D "$hdrs" \
+                 -H "Authorization: Bearer ${GH_TOKEN}" \
+                 -H "Accept: application/vnd.github+json" \
+                 https://api.github.com/user 2>/dev/null)"; then
+    rm -f "$hdrs"
+    return 1
+  fi
+  GH_LOGIN="$(printf '%s' "$body" | sed -n 's/^ *"login": *"\([^"]*\)".*/\1/p' | head -n1)"
+  scopes="$(tr -d '\r' <"$hdrs" | sed -n 's/^[Xx]-[Oo][Aa]uth-[Ss]copes: *//p')"
+  rm -f "$hdrs"
+  # Fine-grained tokens report no scopes header at all; nothing to check.
+  if [ -n "$scopes" ]; then
+    scopes=",${scopes// /},"
+    for sc in repo read:org admin:public_key admin:ssh_signing_key; do
+      case "$scopes" in
+        *",${sc},"*) ;;
+        *) [ "$sc" = read:org ] && case "$scopes" in *,write:org,*|*,admin:org,*) continue ;; esac
+           missing="${missing}${missing:+ }${sc}" ;;
+      esac
+    done
+    [ -z "$missing" ] || warn "token is missing scope(s): ${missing} — gh login or key registration in the box may fail"
+  fi
+}
+
+acquire_gh_token() {
+  local mode="$GH_AUTH" choice reply
+  if [ -n "$GH_TOKEN" ]; then
+    mode=given
+  else
+    case "$mode" in
+      ask|web|paste)
+        if ! tty_ok; then
+          [ "$mode" = ask ] || warn "GH_AUTH=${mode} needs a terminal — skipping GitHub sign-in"
+          mode=skip
+        fi ;;
+      skip) ;;
+      *) die "GH_AUTH must be ask, web, paste or skip, got '${GH_AUTH}'" ;;
+    esac
+  fi
+
+  if [ "$mode" = ask ]; then
+    printf '\n%sGitHub sign-in%s — optional. With a token, the box comes up with gh signed in\nand both generated SSH keys registered with your account.\n\n' "$C_B" "$C_0" >/dev/tty
+    if command -v gh >/dev/null 2>&1; then
+      printf '  1) sign in via browser (one-time code)\n' >/dev/tty
+    else
+      printf '  1) sign in via browser (needs gh on this host — not installed)\n' >/dev/tty
+    fi
+    printf '  2) paste a personal access token\n  3) skip — sign in from inside the container later\n\nChoice [3]: ' >/dev/tty
+    IFS= read -r choice </dev/tty || choice=""
+    case "$choice" in
+      1) mode=web ;;
+      2) mode=paste ;;
+      *) mode=skip ;;
+    esac
+  fi
+
+  case "$mode" in
+    skip)  ok "GitHub: no token — sign in from inside the container later"; return 0 ;;
+    web)   gh_token_via_web   || { GH_TOKEN=""; warn "continuing without a GitHub token"; return 0; } ;;
+    paste) gh_token_via_paste || { GH_TOKEN=""; ok "GitHub: no token — sign in from inside the container later"; return 0; } ;;
+  esac
+
+  # Tokens are [A-Za-z0-9_]; anything else is a paste accident, and would
+  # also break the quoting of provision.env.
+  case "$GH_TOKEN" in
+    *[!A-Za-z0-9_]*) die "that does not look like a GitHub token (unexpected characters)" ;;
+  esac
+
+  GH_LOGIN=""
+  if gh_token_check; then
+    :
+  elif [ "$mode" = given ]; then
+    die "GitHub rejected GH_TOKEN (or api.github.com is unreachable) — fix or unset it"
+  else
+    warn "GitHub rejected that token (or api.github.com is unreachable) — continuing without one"
+    GH_TOKEN=""; return 0
+  fi
+
+  if [ "$GH_AUTH" = ask ] && [ "$mode" != given ] && [ "$GH_AUTH_YES" != 1 ]; then
+    printf 'Pass this token into the container as %s? [Y/n] ' "${GH_LOGIN:-<unknown user>}" >/dev/tty
+    IFS= read -r reply </dev/tty || reply=""
+    case "$reply" in
+      [Nn]*) GH_TOKEN=""; ok "GitHub: token discarded — sign in from inside the container later"; return 0 ;;
+    esac
+  fi
+  ok "GitHub: token for ${GH_LOGIN:-<unknown user>} will be passed into the container"
+}
 
 # Hostnames are DNS labels: letters, digits and hyphens only, no leading or
 # trailing hyphen, 63 characters at most. Instance names may contain
@@ -337,6 +492,9 @@ else
   [ -r "$RUNTIME_SRC" ] || die "RUNTIME_SRC is not readable: ${RUNTIME_SRC}"
 fi
 bash -n "$RUNTIME_SRC" || die "the runtime installer at ${RUNTIME_SRC} is not valid bash"
+
+# Last of the questions, so the long unattended part starts right after.
+acquire_gh_token
 
 mkdir -p "$TEMPLATE_DIR"
 OUT_DIR="${OUT_DIR_BASE}-${CTID}"
@@ -590,6 +748,10 @@ chown -R "$DEV_USER:$DEV_USER" "${DEV_HOME}/.ssh"
 chmod 700 "${DEV_HOME}/.ssh"; chmod 600 "${DEV_HOME}/.ssh/config" "$AUTH_KEY" "$SIGN_KEY"
 
 say "git config with SSH commit signing"
+# ~/.config first, on its own: `install -d` creates missing parents as root, so
+# going straight to ~/.config/git left ~/.config root-owned and every tool that
+# keeps state there — gh first among them — failed with "permission denied".
+install -d -m 755 -o "$DEV_USER" -g "$DEV_USER" "${DEV_HOME}/.config"
 install -d -m 755 -o "$DEV_USER" -g "$DEV_USER" "${DEV_HOME}/.config/git"
 printf '%s namespaces="git" %s\n' "$GIT_EMAIL" "$(cat "${SIGN_KEY}.pub")" \
   > "${DEV_HOME}/.config/git/allowed_signers"

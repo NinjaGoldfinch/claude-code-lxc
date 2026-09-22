@@ -19,6 +19,8 @@
 #   * ~/.claude.json, beyond the two one-time prompt flags claude-rc-preflight
 #     answers when an instance starts
 #   * git config, allowed_signers, or the gh auth state
+# The one exception is the ownership of ~/.config itself, which it repairs if
+# an older provisioning run left it owned by root.
 #   * /etc/claude-instances/*.env — your instances and their workspaces survive
 #   * ~/.tmux.conf, once it exists — yours to edit
 #
@@ -38,7 +40,7 @@ RESTART=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --restart) RESTART=1; shift ;;
-    -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "claude-lxc-runtime: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -100,6 +102,17 @@ esac
 export PATH
 EOF
 chmod 644 /etc/profile.d/10-claude-dev.sh
+
+say "Home directory ownership"
+# Boxes provisioned before this was fixed have a root-owned ~/.config, which
+# breaks gh ("mkdir ~/.config/gh: permission denied") and anything else that
+# keeps state there. Repair the directory itself only; nothing inside it.
+if [ ! -d "${DEV_HOME}/.config" ]; then
+  install -d -m 755 -o "$DEV_USER" -g "$DEV_USER" "${DEV_HOME}/.config"
+elif [ "$(stat -c %U "${DEV_HOME}/.config")" != "$DEV_USER" ]; then
+  chown "$DEV_USER:$DEV_USER" "${DEV_HOME}/.config"
+  echo "repaired ownership of ${DEV_HOME}/.config"
+fi
 
 say "tmux defaults"
 # Written once and then left alone; it is yours to edit after that.

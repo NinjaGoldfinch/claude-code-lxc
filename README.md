@@ -71,7 +71,9 @@ its preflight, the systemd unit and target, the PATH snippet and the shell
 aliases, then restarts the instances that were running. Instances you had
 stopped stay stopped. This is also how a box built before server mode moves to
 it: the registry is untouched, and each instance picks up the defaults for the
-settings that did not exist before.
+settings that did not exist before. It also repairs a root-owned `~/.config`
+left by older provisioning runs, which made `gh auth login` fail with
+`mkdir /home/dev/.config/gh: permission denied`.
 
 It updates this repo's runtime, not Claude Code — for that, run
 [`claude-update`](#updating-claude-code) on the box.
@@ -126,6 +128,12 @@ file on the way through.
   signing`. No token, no problem: `gh` is still installed, and the printed
   instructions cover doing the same three steps interactively after your
   first SSH login.
+- An optional GitHub sign-in *before* the container is created, when run from
+  a terminal without `GH_TOKEN`: sign in through the browser with a one-time
+  code (needs `gh` on the Proxmox host), paste a token (a creation link with
+  the right scopes pre-selected is printed), or skip. The token is checked
+  against GitHub, you're shown who it belongs to and any missing scopes, and
+  asked before it's passed into the container.
 - GitHub's ed25519 host key fingerprint pinned at provision time rather than
   trusting whatever `ssh-keyscan` returns.
 - Claude Code installed via the native installer (auto-updating), falling back
@@ -301,7 +309,7 @@ look under **Remote Control** — one server per instance will be waiting, ready
 for you to start sessions on. The exact names are printed at the end of
 provisioning and listed in the credentials bundle.
 
-If you did not pass `GH_TOKEN`, there's a second manual step for GitHub itself
+If you skipped the GitHub sign-in and did not pass `GH_TOKEN`, there's a second manual step for GitHub itself
 — from the same SSH session:
 
 ```bash
@@ -371,7 +379,9 @@ Everything is an environment variable. Defaults in parentheses.
 | `ROOTFS_URL` | linuxcontainers.org rootfs to use |
 | `DEV_USER` / `WORKSPACE_ROOT` / `SSH_PORT` | Guest user, parent dir for instance workspaces, sshd port |
 | `GIT_NAME` / `GIT_EMAIL` | Git identity and `allowed_signers` entry |
-| `GH_TOKEN` | GitHub token for non-interactive `gh auth login` + automatic key registration (blank = do it interactively later) |
+| `GH_TOKEN` | GitHub token for non-interactive `gh auth login` + automatic key registration (blank = see `GH_AUTH`) |
+| `GH_AUTH` | With no `GH_TOKEN`: `ask` offers browser sign-in / paste / skip before the container is created, `web` or `paste` go straight to that, `skip` asks nothing (`ask`; no terminal = `skip`) |
+| `GH_AUTH_YES` | `1` passes the token in without the "continue as &lt;login&gt;?" confirmation (`0`) |
 | `INSTALL_NODE` | Install Node.js 22 (`1`) |
 | `CLAUDE_CHANNEL` | `latest` or `stable` |
 | `ALLOW_UNVERIFIED_GITHUB_HOSTKEY` | Continue past a GitHub host key mismatch (`0`) |
@@ -428,7 +438,9 @@ pct console <CTID>                        # console from the Proxmox host
   token scoped to `admin:public_key` **and** `admin:ssh_signing_key` (classic
   — the signing-key registration 404s without the second one), or "SSH keys"
   + "SSH signing keys" write access (fine-grained), and revoke it once you've
-  confirmed `gh ssh-key list` shows both keys.
+  confirmed `gh ssh-key list` shows both keys. Browser sign-in (`GH_AUTH=web`)
+  runs the host's `gh` against a throwaway config directory, so it never
+  touches a `gh` login the Proxmox host already has.
 - Each instance pre-accepts the workspace-trust dialog for its own workspace
   and Remote Control's one-time confirmation, by setting
   `hasTrustDialogAccepted` and `remoteDialogSeen` in `~/.claude.json`. A prompt
