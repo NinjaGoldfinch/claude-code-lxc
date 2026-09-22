@@ -5,8 +5,9 @@
 # Creates a Debian 13 (trixie) LXC container on a Proxmox VE host, set up as a
 # remote development box running one or more *instances* of Claude Code in
 # Remote Control server mode. Each instance has its own workspace, its own tmux
-# session and its own name in the claude.ai/code session picker; they all share
-# one claude.ai login and one git/GitHub identity.
+# session and its own entry under Remote Control at claude.ai/code, where you
+# can start as many sessions on it as you like; they all share one claude.ai
+# login and one git/GitHub identity.
 #
 # It handles:
 #   * downloading + checksum-verifying the linuxcontainers.org rootfs
@@ -20,9 +21,13 @@
 #   * hardened sshd (key-only, socket-activation disabled so Port works)
 #   * Claude Code install + settings tuned for Remote Control
 #   * a templated systemd unit (claude-remote@<instance>.service) that runs
-#     `claude --remote-control` inside tmux and brings it back after a reboot
-#     or a crash, plus a claude-remote.target covering the whole fleet
+#     `claude remote-control` — the server, so claude.ai/code can open as many
+#     sessions on it as you like — inside tmux, and brings it back after a
+#     reboot or a crash, plus a claude-remote.target covering the whole fleet
 #   * a `claude-instance` CLI for adding/removing/listing instances at runtime
+#   * a `claude-update` command that updates Claude Code and restarts the fleet
+#   * a `claude-instance reset` that wipes the box back to this state later,
+#     which reset-claude-lxc.sh drives from the host
 #   * a credentials bundle written to the Proxmox host for you to file away
 #
 # RUN THIS ON THE PROXMOX HOST, AS ROOT.
@@ -89,7 +94,7 @@ SSH_PORT="${SSH_PORT:-22}"
 # More can be added later on the box itself with:  claude-instance add <name>
 INSTANCES="${INSTANCES:-main}"
 
-# Session names shown in the claude.ai/code picker are "${CT_HOSTNAME}-<name>",
+# Names shown in the claude.ai/code picker are "${CT_HOSTNAME}-<name>",
 # collapsing to just "${CT_HOSTNAME}" when the hostname already begins with the
 # instance name — so a single-project box reads "ninja-recorder-dev-container"
 # rather than "ninja-recorder-dev-container-ninja-recorder". Override per
@@ -115,6 +120,20 @@ GH_TOKEN="${GH_TOKEN:-}"
 # Extra toolchain
 INSTALL_NODE="${INSTALL_NODE:-1}"                  # Node.js 22 from NodeSource
 CLAUDE_CHANNEL="${CLAUDE_CHANNEL:-latest}"         # latest | stable
+
+# How each instance's Remote Control server creates the sessions you open from
+# claude.ai/code:
+#   same-dir  every session works in the instance workspace (claude's default)
+#   worktree  each on-demand session gets its own git worktree, so two sessions
+#             never edit the same file. Needs the workspace to be a git repo;
+#             instances fall back to same-dir until it is one
+#   session   one session per instance, the pre-server-mode behaviour
+# Change it per instance later with: claude-instance set <name> --spawn <mode>
+SPAWN_MODE="${SPAWN_MODE:-same-dir}"
+# How many sessions one instance serves at once. Blank keeps claude's own
+# default of 32. Every concurrent session is another Claude Code process, so
+# the ceiling that matters is the container's RAM, not this number.
+CAPACITY="${CAPACITY:-}"
 
 # The shared runtime installer. Looked for next to this script first; when that
 # fails — running via `bash -c "$(curl ...)"`, say — it is fetched from
@@ -215,6 +234,16 @@ valid_instance_name() {
 log "Preflight checks"
 [ "$(id -u)" -eq 0 ] || die "run this as root on the Proxmox host"
 need pct; need pvesm; need openssl; need curl; need ssh-keygen
+
+case "$SPAWN_MODE" in
+  same-dir|worktree|session) ;;
+  *) die "SPAWN_MODE must be same-dir, worktree or session, got '${SPAWN_MODE}'" ;;
+esac
+case "$CAPACITY" in
+  "") ;;
+  *[!0-9]*) die "CAPACITY must be a whole number, got '${CAPACITY}'" ;;
+  *) [ "$CAPACITY" -ge 1 ] && [ "$CAPACITY" -le 999 ] || die "CAPACITY must be between 1 and 999" ;;
+esac
 
 # Parse INSTANCES into parallel name/workspace arrays. Do this before anything
 # expensive so a typo fails in the first second, not halfway through a build.
@@ -442,6 +471,9 @@ GIT_EMAIL='${GIT_EMAIL}'
 CT_HOSTNAME='${CT_HOSTNAME}'
 INSTALL_NODE='${INSTALL_NODE}'
 CLAUDE_CHANNEL='${CLAUDE_CHANNEL}'
+SPAWN_MODE='${SPAWN_MODE}'
+CAPACITY='${CAPACITY}'
+CTID='${CTID}'
 GITHUB_ED25519_FP='${GITHUB_ED25519_FP}'
 ALLOW_UNVERIFIED_GITHUB_HOSTKEY='${ALLOW_UNVERIFIED_GITHUB_HOSTKEY}'
 ROOT_PW='${ROOT_PW}'
@@ -672,18 +704,24 @@ install -d -m 755 -o "$DEV_USER" -g "$DEV_USER" "$WORKSPACE_ROOT"
 say "Remote Control runtime"
 # claude-lxc-runtime.sh is the single source of truth for the runtime files;
 # update-claude-lxc.sh re-runs the very same script later.
+# CTID goes in so the box knows which container it is, which is what
+# `claude-instance reset` asks you to type back.
 DEV_USER="$DEV_USER" WORKSPACE_ROOT="$WORKSPACE_ROOT" CT_HOSTNAME="$CT_HOSTNAME" \
-  /root/claude-lxc-runtime.sh
+  CTID="$CTID" /root/claude-lxc-runtime.sh
 
 
 
 say "Remote Control instances"
+# Blank CAPACITY means "leave claude's own default alone", so pass no flag.
+CAPACITY_ARGS=()
+if [ -n "${CAPACITY:-}" ]; then CAPACITY_ARGS=(--capacity "$CAPACITY"); fi
 for spec in $INSTANCES_SPEC; do
   inst_name="${spec%%:*}"
   inst_ws="${spec#*:}"
   # --no-start: nothing can connect until the one-time claude.ai login is done,
   # so leave them enabled but idle and let the operator start the target.
-  /usr/local/bin/claude-instance add "$inst_name" --workspace "$inst_ws" --no-start
+  /usr/local/bin/claude-instance add "$inst_name" --workspace "$inst_ws" \
+    --spawn "$SPAWN_MODE" "${CAPACITY_ARGS[@]}" --no-start
 done
 
 say "Cleanup"
@@ -825,17 +863,21 @@ update it and rewrite allowed_signers:
 -- Remote Control instances --------------------------------------------------------
 ${INSTANCE_TABLE}
 
-Each instance is its own Remote Control server with its own workspace and its
-own entry in the claude.ai/code session picker. They share one claude.ai login
-(~/.claude) and one git identity, so you only sign in once.
+Each instance is its own Remote Control server with its own workspace. Pick one
+under Remote Control at claude.ai/code or in the Claude app and start as many
+sessions on it as you like — up to ${CAPACITY:-32} at once, spawn mode
+${SPAWN_MODE}. They share one claude.ai login (~/.claude) and one git identity,
+so you only sign in once.
 
 -- Day to day --------------------------------------------------------------------
 List instances:                  claude-instance list          (alias: ci list)
 Attach to one:                   ca <instance>
 Add another:                     sudo claude-instance add <name>
+Change one:                      sudo claude-instance set <name> --spawn worktree
 Remove one:                      sudo claude-instance remove <name> [--purge]
 Per-instance control:            sudo claude-instance {start,stop,restart} <name>
-Whole fleet:                     sudo systemctl restart claude-remote.target
+Whole fleet:                     sudo systemctl restart claude-remote.target  (alias: cr)
+Update Claude Code + restart:    claude-update                 (alias: cu)
 Per-instance logs:               journalctl -u claude-remote@<instance>
 Workspace root:                  ${WORKSPACE_ROOT}
 Autostart:                       container onboot=1 + claude-remote.target and each
@@ -882,8 +924,9 @@ Every instance shares one login, so you only do this once.
   4) ci list       # every instance and its state
      ca ${INST_NAMES[0]}   # attach; the session URL and QR code are shown there
 
-Then open claude.ai/code or the Claude mobile app. ${INST_COUNT} session(s) will be
-waiting, one per instance:
+Then open claude.ai/code or the Claude mobile app and look under Remote Control.
+${INST_COUNT} server(s) will be waiting, one per instance, each ready to open new
+sessions on:
 
 $(printf '%s\n' "$INSTANCE_ROWS" \
     | while IFS=$'\t' read -r n sess ws; do printf '  %-30s %s\n' "$sess" "$ws"; done)
@@ -892,6 +935,20 @@ Add more at any time, no reprovision needed:
 
   sudo claude-instance add <name>              # workspace ${WORKSPACE_ROOT}/<name>
   sudo claude-instance remove <name> [--purge]
+  sudo claude-instance set <name> --spawn worktree   # a worktree per session
+
+Updating Claude Code later is one command — it updates the shared CLI and
+restarts every running instance onto it:
+
+  claude-update                                # alias: cu
+  cr                                           # just restart the fleet
+
+Starting over is one too. It empties the workspaces and drops the claude.ai
+login, but keeps the container, the users, the SSH keys and the GitHub
+registrations, so all you redo is /login:
+
+  ./reset-claude-lxc.sh ${CTID}                        # from the Proxmox host
+  sudo claude-instance reset                   # or from inside the box
 
 It all survives reboots: the container starts on boot and claude-remote.target
 brings every enabled instance back with it.

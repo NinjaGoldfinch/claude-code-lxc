@@ -3,10 +3,17 @@
 # update-claude-lxc.sh
 #
 # Refreshes the *code* on containers already provisioned by
-# provision-claude-lxc.sh: the claude-instance CLI, the supervised session
-# wrapper, the systemd template unit and target, the PATH snippet and the shell
-# aliases. It pushes claude-lxc-runtime.sh — the same file provisioning uses —
-# and runs it inside each container, so the two can never drift apart.
+# provision-claude-lxc.sh: the claude-instance CLI, the claude-update helper,
+# the supervised server wrapper and its preflight, the systemd template unit and
+# target, the PATH snippet and the shell aliases. It pushes
+# claude-lxc-runtime.sh — the same file provisioning uses — and runs it inside
+# each container, so the two can never drift apart.
+#
+# This is how an older box moves to Remote Control *server* mode: the registry
+# keeps every instance exactly as it was, and each one gains claude's defaults
+# for the settings that did not exist before (same-dir spawning, 32 sessions).
+# It refreshes the runtime, not Claude Code itself — for that, run
+# `claude-update` on the box.
 #
 # It does not touch anything you would have to re-do afterwards:
 #   * no passwords are generated or changed
@@ -17,6 +24,9 @@
 #     workspaces come back exactly as they were
 #   * ~/.claude/settings.json and ~/.tmux.conf are yours after provisioning and
 #     are never rewritten
+#
+# To wipe a box back to just-provisioned instead — empty workspaces, no
+# claude.ai login, everything else intact — use reset-claude-lxc.sh.
 #
 # RUN THIS ON THE PROXMOX HOST, AS ROOT.
 #
@@ -44,7 +54,7 @@ CTIDS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-restart) RESTART=0; shift ;;
-    -h|--help)    sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)    sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)           die "unknown option: $1" ;;
     *)            CTIDS+=("$1"); shift ;;
   esac
@@ -115,6 +125,9 @@ for ctid in "${CTIDS[@]}"; do
   for var in DEV_USER WORKSPACE_ROOT CT_HOSTNAME; do
     if [ -n "${!var:-}" ]; then ENV_ARGS="${ENV_ARGS}${var}='${!var}' "; fi
   done
+  # Only the host knows the CTID, and here it is the argument we were given.
+  # Boxes provisioned before it was recorded pick it up on their first update.
+  ENV_ARGS="${ENV_ARGS}CTID='${ctid}' "
 
   BEFORE="$(pct exec "$ctid" -- /usr/local/bin/claude-instance list 2>/dev/null || true)"
 
