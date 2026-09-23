@@ -410,6 +410,21 @@ These will break Remote Control quietly rather than loudly:
 
 The wrapper script unsets all of these defensively before starting the session.
 
+Sessions opened on a server can't publish artifacts or send you files. As of
+Claude Code 2.1.280, a session spawned by `claude remote-control` has no
+Artifact tool, and its file sends fail with "not on a project thread". Setting
+`"enableArtifact": true` doesn't change this. An interactive `claude` on the
+same box, account and version publishes fine, so this is a Remote Control
+limitation, not something the box gets wrong. When you need either one, start
+the session yourself and connect it to the app:
+
+```bash
+cd <workspace> && claude    # then run /remote-control inside it
+```
+
+It then shows up in claude.ai/code and the Claude app like any other session.
+It isn't supervised, though: it ends when you quit it or the box restarts.
+
 ## Day to day
 
 ```bash
