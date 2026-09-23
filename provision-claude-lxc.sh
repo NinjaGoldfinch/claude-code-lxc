@@ -856,6 +856,7 @@ cat > "${DEV_HOME}/.claude/settings.json" <<EOF
   "autoUpdatesChannel": "${CLAUDE_CHANNEL}",
   "remoteControlAtStartup": true,
   "includeCoAuthoredBy": false,
+  "enableArtifact": true,
   "theme": "dark"
 }
 EOF
